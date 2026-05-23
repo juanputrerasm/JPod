@@ -1,13 +1,14 @@
 # JPod: Terminal Reality POD archive utility
 
-A Java 17 desktop tool for viewing, extracting, and building Terminal Reality **POD** (version 1) archives — the proprietary container format used by games including *Monster Truck Madness 1 & 2*, *CART Precision Racing*, *Hellbender*, *Terminal Velocity*, and *Fury3*.
+A Java 17 desktop tool for viewing, extracting, and building Terminal Reality **POD** (version 1) archives, the proprietary container format used by games including *Monster Truck Madness 1 & 2*, *CART Precision Racing*, *Hellbender*, *Terminal Velocity*, and *Fury3*. 
+JPod also includes read-only support for `POD2` (*Nocture*, *4x4 Evo 1 & 2*) and `EPD` (*Fly!*) archives for browsing, previewing, and extraction.
 
 ---
 
 ## Features
 
 ### Archive viewing
-- Open any `.pod` file and browse its contents in a file-viewer style table with Name / Size / Description columns.
+- Open `.pod` (and `.epd`) archives and browse their contents in a file-viewer style table with Name / Size / Description columns.
 - Archive folders and subfolders are shown with icons and start collapsed by default, so root files and top-level folders are easier to scan.
 - Click column headers to sort by name, size, or description; clicking again reverses the sort, and a third click returns to the default archive order.
 - Use the quick search field above the table to filter visible entries instantly, or open the Advanced search dialog for targeted searches and jump-to selection.
@@ -15,20 +16,25 @@ A Java 17 desktop tool for viewing, extracting, and building Terminal Reality **
 - JPod keeps a list of the 10 most recently opened files in a per-user JSON config stored in the operating system's preferences/config location.
 
 ### Extraction
-- **Extract All** — writes every entry to a chosen folder, recreating the archive's subfolder structure automatically.
-- **Extract Selected** — extracts highlighted entries to a chosen folder, with an option to preserve or flatten the archive folder structure.
+- **Extract All** - writes every entry to a chosen folder, recreating the archive's subfolder structure automatically.
+- **Extract Selected** - extracts highlighted entries to a chosen folder, with an option to preserve or flatten the archive folder structure.
 
 ### Archive building & editing
-- **New Archive** — start an empty archive from scratch.
-- **Open Response List File** — load a `.lst` text file (one filename per line) and resolve each file from disk to build the entry list. Supports an optional `filename,archiveName` syntax per line.
-- **Add Files** — append individual files via a file picker or by **drag-and-dropping** files directly onto the entry table.
-- **Remove** — delete selected entries from the in-memory list.
-- **Replace** (right-click) — swap a single entry's data with a file from disk, keeping the original archive name.
-- **Save As** — write the current entry list to a new `.pod` file using the exact Terminal Reality binary layout.
+- **New Archive** - start an empty archive from scratch.
+- **Open Response List File** - load a `.lst` text file (one filename per line) and resolve each file from disk to build the entry list. Supports an optional `filename,archiveName` syntax per line.
+- **Add Files** - append individual files via a file picker or by drag-and-dropping files directly onto the entry table.
+- **Remove** - delete selected entries from the in-memory list.
+- **Replace** (right-click) - swap a single entry's data with a file from disk, keeping the original archive name.
+- **Save As** - write the current entry list to a new `.pod` file.
+
+### Format support
+- `POD1` - full browse, preview, extract, and save support.
+- `POD2` - browse, preview, and extract support.
+- `EPD` - browse, preview, and extract support.
 
 ### Reports
-- **Save .inf** — exports a fixed-column text report (filename, total size, entry count, comment, and a padded name / size / offset table).
-- **Save .lst** — exports a plain entry-name list compatible with the manifest loader above.
+- **Save .inf** - exports a fixed-column text report (filename, total size, entry count, comment, and a padded name / size / offset table).
+- **Save .lst** - exports a plain entry-name list compatible with the Response list loader.
 
 ### File preview
 Double-click any entry (or press Preview from the right-click menu) to open a type-aware preview:
@@ -68,8 +74,22 @@ Adds the open archive to the game's `pod.ini` mount list. JPod uses `99` as the 
 
 ## What JPod does not do
 
-- **No MOD music playback** — Terminal Reality's `.mod` files (6-channel ProTracker) require a tracker player. Extract the file and play it in an external player (e.g. VLC, OpenMPT).
-- **No in-place archive editing** — changes are always written to a *new* file via Save As; the original POD is never modified.
+- No save feature for POD v2 and EPD format.
+- No MOD music playback - Terminal Reality's `.mod` files (6-channel ProTracker) require a tracker player. Extract the file and play it in an external player (e.g. VLC, OpenMPT).
+- No In-place archive editing - changes are always written to a *new* file via Save As; the original POD is never modified.
+- No POD v3, 4, 5, 6 support.
+
+---
+
+## License
+
+JPod is licensed under the Apache License 2.0.
+
+---
+
+## Download
+
+Download the latest build from the [Releases](../../releases) page.
 
 ---
 
@@ -132,8 +152,6 @@ src/main/java/com/mtm2/jpod/
     ├── ExtractOptionsDialog.java  Extract destination & options
     ├── SearchDialog.java          Entry search
     └── AboutDialog.java
-src/main/resources/palettes/
-    README.txt   ← drop metalcr2.act here for the default RAW palette
 ```
 
 ---
@@ -141,3 +159,5 @@ src/main/resources/palettes/
 ## References
 
 - [Monster Truck Madness Guild](https://www.mtm2.com/%7Emtmg/index.shtml)
+- [EPD Format Reference](https://github.com/jopadan/termpod/wiki/EPD-Format-Reference)
+- [Pod 2 Format Reference](https://github.com/jopadan/termpod/wiki/Pod-2-Format-Reference)

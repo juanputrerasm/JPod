@@ -28,14 +28,36 @@ import java.util.Optional;
  */
 public final class PodArchive {
 
+    public enum Format {
+        POD1("POD"),
+        POD2("POD2"),
+        EPD("EPD");
+
+        private final String displayName;
+
+        Format(String displayName) {
+            this.displayName = displayName;
+        }
+
+        public String displayName() {
+            return displayName;
+        }
+    }
+
+    private final Format format;
     private final String comment;
     private final byte[] bytes;
     private final List<Entry> entries;
 
-    PodArchive(String comment, byte[] bytes, List<Entry> entries) {
+    PodArchive(Format format, String comment, byte[] bytes, List<Entry> entries) {
+        this.format = Objects.requireNonNull(format);
         this.comment = Objects.requireNonNull(comment);
         this.bytes = Objects.requireNonNull(bytes);
         this.entries = List.copyOf(entries);
+    }
+
+    public Format getFormat() {
+        return format;
     }
 
     /** Returns the 80-character archive comment from the POD header (trimmed). */

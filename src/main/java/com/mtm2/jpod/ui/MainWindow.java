@@ -315,14 +315,14 @@ public final class MainWindow extends JFrame {
     }
 
     // -------------------------------------------------------------------------
-    // Actions — open / new / manifest
+    // Actions - open / new / manifest
     // -------------------------------------------------------------------------
 
     private void onOpen() {
         if (!confirmDiscardChanges()) return;
         JFileChooser fc = new JFileChooser();
         fc.setDialogTitle("Open POD Archive");
-        fc.setFileFilter(new FileNameExtensionFilter("POD Archives (*.pod)", "pod", "POD"));
+        fc.setFileFilter(new FileNameExtensionFilter("POD Archive files (*.pod, *.epd)", "pod", "POD", "epd", "EPD"));
         fc.setAcceptAllFileFilterUsed(true);
         applyRecentFolder(fc);
         if (fc.showOpenDialog(this) != JFileChooser.APPROVE_OPTION) return;
@@ -341,7 +341,7 @@ public final class MainWindow extends JFrame {
         dirty = false;
         session.reset();
         refreshTable();
-        setTitle(TITLE + " — New Archive");
+        setTitle(TITLE + " - New Archive");
         progressLabel.setText("Add files with 'Add Files…' or drag and drop, then 'Save As…'.");
     }
 
@@ -362,7 +362,7 @@ public final class MainWindow extends JFrame {
     }
 
     // -------------------------------------------------------------------------
-    // Actions — editing
+    // Actions - editing
     // -------------------------------------------------------------------------
 
     /**
@@ -441,7 +441,7 @@ public final class MainWindow extends JFrame {
      */
     private void onSaveAs() {
         if (editableEntries.isEmpty()) {
-            JOptionPane.showMessageDialog(this, "Nothing to save — add files first.", TITLE,
+            JOptionPane.showMessageDialog(this, "Nothing to save - add files first.", TITLE,
                     JOptionPane.WARNING_MESSAGE);
             return;
         }
@@ -472,7 +472,7 @@ public final class MainWindow extends JFrame {
                     session.setTargetFolderPath(target.getParent());
                     session.setTargetFileName(target.getFileName().toString());
                     progressLabel.setText("Saved: " + target.getFileName());
-                    setTitle(TITLE + " — " + target.getFileName());
+                    setTitle(TITLE + " - " + target.getFileName());
                 } catch (Exception ex) {
                     showError("Save failed", ex);
                 }
@@ -481,12 +481,12 @@ public final class MainWindow extends JFrame {
     }
 
     // -------------------------------------------------------------------------
-    // Actions — extract
+    // Actions - extract
     // -------------------------------------------------------------------------
 
     private void onExtractAll() {
         if (editableEntries.isEmpty()) { showNoArchive(); return; }
-        Path dest = chooseFolder("Extract All — Choose Destination");
+        Path dest = chooseFolder("Extract All - Choose Destination");
         if (dest == null) return;
         extractEntries(indexRange(editableEntries.size()), dest);
     }
@@ -557,7 +557,7 @@ public final class MainWindow extends JFrame {
     }
 
     // -------------------------------------------------------------------------
-    // Actions — reports / export
+    // Actions - reports / export
     // -------------------------------------------------------------------------
 
     private void onExportInfo() {
@@ -588,7 +588,7 @@ public final class MainWindow extends JFrame {
     }
 
     // -------------------------------------------------------------------------
-    // Actions — tools
+    // Actions - tools
     // -------------------------------------------------------------------------
 
     private void onMount() {
@@ -894,7 +894,7 @@ public final class MainWindow extends JFrame {
                     dirty = false;
                     refreshTable();
                     rememberOpenedFile(selected);
-                    setTitle(TITLE + " — " + selected.getFileName());
+                    setTitle(TITLE + " - " + selected.getFileName()  + " (" + archive.getFormat().displayName() + ")");
                 } catch (Exception ex) {
                     showError("Failed to open archive", ex);
                 }
@@ -926,7 +926,7 @@ public final class MainWindow extends JFrame {
                     dirty = true;
                     refreshTable();
                     rememberOpenedFile(manifestPath);
-                    setTitle(TITLE + " — " + manifestPath.getFileName() + " (manifest)");
+                    setTitle(TITLE + " - " + manifestPath.getFileName() + " (manifest)");
                     progressLabel.setText(blobs.size() + " entries loaded from manifest.");
                 } catch (Exception ex) {
                     showError("Failed to load manifest", ex);
