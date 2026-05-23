@@ -11,14 +11,13 @@ import java.nio.file.Path;
  * Extract options dialog.
  *
  * <p>Lets the user pick a destination folder and toggle whether to preserve
- * the archive's subfolder structure or merge all entries into a single output file.
+ * the archive's subfolder structure.
  * Confirmed choices are written back into the provided {@link com.mtm2.jpod.PodSession}.
  */
 public final class ExtractOptionsDialog extends JDialog {
 
     private final JTextField folderField = new JTextField(30);
     private final JCheckBox preserveFoldersCheck = new JCheckBox("Preserve folder structure", true);
-    private final JCheckBox singleFileCheck = new JCheckBox("Merge into single output file");
     private boolean confirmed;
     private final PodSession session;
 
@@ -29,20 +28,16 @@ public final class ExtractOptionsDialog extends JDialog {
         if (session.getTargetFolderPath() != null) {
             folderField.setText(session.getTargetFolderPath().toString());
         }
+        preserveFoldersCheck.setSelected(session.isPreserveExtractFolderStructure());
 
         JButton browseBtn = new JButton("Browse…");
         browseBtn.addActionListener(e -> {
             JFileChooser fc = new JFileChooser();
-            fc.setFileSelectionMode(singleFileCheck.isSelected()
-                    ? JFileChooser.FILES_ONLY : JFileChooser.DIRECTORIES_ONLY);
+            fc.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
             fc.setDialogTitle("Choose Extract Destination");
             if (fc.showOpenDialog(this) == JFileChooser.APPROVE_OPTION) {
                 folderField.setText(fc.getSelectedFile().getAbsolutePath());
             }
-        });
-
-        singleFileCheck.addActionListener(e -> {
-            preserveFoldersCheck.setEnabled(!singleFileCheck.isSelected());
         });
 
         JButton okBtn = new JButton("Extract");
@@ -53,7 +48,7 @@ public final class ExtractOptionsDialog extends JDialog {
                 return;
             }
             session.setTargetFolderPath(Path.of(folderField.getText()));
-            session.setExtractToSingleOutputFile(singleFileCheck.isSelected());
+            session.setPreserveExtractFolderStructure(preserveFoldersCheck.isSelected());
             confirmed = true;
             dispose();
         });
@@ -67,9 +62,8 @@ public final class ExtractOptionsDialog extends JDialog {
         folderRow.add(folderField, BorderLayout.CENTER);
         folderRow.add(browseBtn, BorderLayout.EAST);
 
-        JPanel checkPanel = new JPanel(new GridLayout(2, 1, 0, 4));
+        JPanel checkPanel = new JPanel(new GridLayout(1, 1, 0, 4));
         checkPanel.add(preserveFoldersCheck);
-        checkPanel.add(singleFileCheck);
 
         form.add(folderRow, BorderLayout.NORTH);
         form.add(checkPanel, BorderLayout.CENTER);
@@ -82,7 +76,7 @@ public final class ExtractOptionsDialog extends JDialog {
         add(form, BorderLayout.CENTER);
         add(btnPanel, BorderLayout.SOUTH);
         pack();
-        setMinimumSize(new Dimension(420, 160));
+        setMinimumSize(new Dimension(420, 135));
         setLocationRelativeTo(owner);
     }
 

@@ -202,6 +202,7 @@ public final class MainWindow extends JFrame {
 
         bar.add(toolButton("Open…",           this::onOpen));
         bar.add(toolButton("Save As…",        this::onSaveAs));
+        bar.addSeparator();
         bar.add(toolButton("Expand +",        this::expandAllFolders));
         bar.add(toolButton("Collapse -",      this::collapseAllFolders));
         bar.addSeparator();
@@ -487,7 +488,7 @@ public final class MainWindow extends JFrame {
         if (editableEntries.isEmpty()) { showNoArchive(); return; }
         Path dest = chooseFolder("Extract All — Choose Destination");
         if (dest == null) return;
-        extractEntries(indexRange(editableEntries.size()), dest, false);
+        extractEntries(indexRange(editableEntries.size()), dest);
     }
 
     private void onExtractSelected() {
@@ -502,14 +503,15 @@ public final class MainWindow extends JFrame {
         if (!dlg.wasConfirmed()) return;
 
         Path dest = session.getTargetFolderPath();
-        extractEntries(selectedSourceRows(), dest, session.isExtractToSingleOutputFile());
+        extractEntries(selectedSourceRows(), dest);
     }
 
     /** Writes the given entry indices to {@code destRoot}. */
-    private void extractEntries(int[] indices, Path destRoot, boolean singleFile) {
+    private void extractEntries(int[] indices, Path destRoot) {
         List<EditableEntry> toExtract = new ArrayList<>();
         for (int i : indices) toExtract.add(editableEntries.get(i));
         int total = toExtract.size();
+        boolean preserveFolders = session.isPreserveExtractFolderStructure();
 
         setBusy(true);
         new SwingWorker<Void, Integer>() {
@@ -517,9 +519,10 @@ public final class MainWindow extends JFrame {
                 for (int i = 0; i < toExtract.size(); i++) {
                     publish(i + 1);
                     EditableEntry e = toExtract.get(i);
-                    Path dest = singleFile ? destRoot
-                            : resolveEntryDest(destRoot, e.name());
-                    Files.createDirectories(dest.getParent());
+                    Path dest = resolveEntryDest(destRoot, e.name(), preserveFolders);
+                    if (dest.getParent() != null) {
+                        Files.createDirectories(dest.getParent());
+                    }
                     Files.write(dest, e.data());
                 }
                 return null;
@@ -536,9 +539,12 @@ public final class MainWindow extends JFrame {
     }
 
     /** Converts a POD entry name (backslash separators) to an OS path under {@code root}. */
-    private static Path resolveEntryDest(Path root, String entryName) {
+    private static Path resolveEntryDest(Path root, String entryName, boolean preserveFolders) {
         String clean = entryName.replace('\0', ' ').strip();
         String[] parts = clean.split("[/\\\\]");
+        if (!preserveFolders) {
+            return root.resolve(parts[parts.length - 1]);
+        }
         Path p = root;
         for (String part : parts) p = p.resolve(part);
         return p;

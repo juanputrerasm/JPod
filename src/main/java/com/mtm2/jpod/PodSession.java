@@ -35,11 +35,8 @@ public final class PodSession {
     /** Total byte size of the open POD file on disk. */
     private long archiveByteSize;
 
-    /**
-     * When true, all selected entries are concatenated into a single output file
-     * (maps to gExtractToSingleOutputFile in PodGlobals).
-     */
-    private boolean extractToSingleOutputFile;
+    /** When true, extracted entries keep their POD folder structure under the chosen destination. */
+    private boolean preserveExtractFolderStructure = true;
 
     /** True if any non-fatal issue occurred during the last operation (e.g. a missing source file). */
     private boolean hadOperationIssue;
@@ -76,9 +73,9 @@ public final class PodSession {
     public long getArchiveByteSize() { return archiveByteSize; }
     public void setArchiveByteSize(long archiveByteSize) { this.archiveByteSize = archiveByteSize; }
 
-    public boolean isExtractToSingleOutputFile() { return extractToSingleOutputFile; }
-    public void setExtractToSingleOutputFile(boolean extractToSingleOutputFile) {
-        this.extractToSingleOutputFile = extractToSingleOutputFile;
+    public boolean isPreserveExtractFolderStructure() { return preserveExtractFolderStructure; }
+    public void setPreserveExtractFolderStructure(boolean preserveExtractFolderStructure) {
+        this.preserveExtractFolderStructure = preserveExtractFolderStructure;
     }
 
     public boolean isHadOperationIssue() { return hadOperationIssue; }
@@ -93,7 +90,7 @@ public final class PodSession {
         targetFileName = null;
         archiveComment = "";
         archiveByteSize = 0;
-        extractToSingleOutputFile = false;
+        preserveExtractFolderStructure = true;
         hadOperationIssue = false;
     }
 }

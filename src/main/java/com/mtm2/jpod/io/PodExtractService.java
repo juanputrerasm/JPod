@@ -62,22 +62,13 @@ public final class PodExtractService {
     public void extractSelected(List<PodArchive.Entry> selectedEntries, IntConsumer progressCallback)
             throws IOException {
         requireOpenArchive();
-        Path targetRoot;
-        if (session.isExtractToSingleOutputFile()) {
-            targetRoot = null;
-        } else {
-            targetRoot = requireTargetFolder();
-        }
+        Path targetRoot = requireTargetFolder();
 
         try (FileChannel src = FileChannel.open(session.getSourcePath(), StandardOpenOption.READ)) {
             for (int i = 0; i < selectedEntries.size(); i++) {
                 if (progressCallback != null) progressCallback.accept(i + 1);
                 PodArchive.Entry entry = selectedEntries.get(i);
-                if (session.isExtractToSingleOutputFile()) {
-                    extractEntryToFile(src, entry, session.getTargetFolderPath());
-                } else {
-                    extractEntry(src, entry, targetRoot);
-                }
+                extractEntry(src, entry, targetRoot);
             }
         }
     }

@@ -16,7 +16,7 @@ A Java 17 desktop tool for viewing, extracting, and building Terminal Reality **
 
 ### Extraction
 - **Extract All** — writes every entry to a chosen folder, recreating the archive's subfolder structure automatically.
-- **Extract Selected** — extracts highlighted entries; optionally merges them into a single output file.
+- **Extract Selected** — extracts highlighted entries to a chosen folder, with an option to preserve or flatten the archive folder structure.
 
 ### Archive building & editing
 - **New Archive** — start an empty archive from scratch.
