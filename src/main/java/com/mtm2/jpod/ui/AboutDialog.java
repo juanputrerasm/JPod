@@ -9,12 +9,12 @@ public final class AboutDialog extends JDialog {
     public AboutDialog(Frame owner) {
         super(owner, "About JPod", true);
 
-        JLabel title = new JLabel("JPod v1.1", SwingConstants.CENTER);
+        JLabel title = new JLabel("JPod v1.2", SwingConstants.CENTER);
         title.setFont(title.getFont().deriveFont(Font.BOLD, 22f));
 
         JLabel subtitle = new JLabel(
                 "<html><div style='text-align:center'>"
-                + "Terminal Reality POD Archive ver 1 Viewer &amp; Extractor<br>"
+                + "Terminal Reality POD Archive Viewer &amp; Extractor<br>"
                 + "by Juan Pablo Utreras \"Kmaster\"<br>"
                 + "Based on WinPod by MDMRE<br><br>"
                 + "<tt>www.mtm2.com</tt>"
