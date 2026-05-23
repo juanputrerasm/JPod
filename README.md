@@ -110,6 +110,18 @@ Download the latest build from the [Releases](../../releases) page.
 
 ---
 
+## License
+
+JPod is licensed under the Apache License 2.0.
+
+---
+
+## Download
+
+Download the latest build from the [Releases](../../releases) page.
+
+---
+
 ## Requirements
 
 | Requirement | Version |
