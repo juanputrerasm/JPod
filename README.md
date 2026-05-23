@@ -73,6 +73,18 @@ Adds the open archive to the game's `pod.ini` mount list. JPod uses `99` as the 
 
 ---
 
+## License
+
+JPod is licensed under the Apache License 2.0.
+
+---
+
+## Download
+
+Download the latest build from the [Releases](../../releases) page.
+
+---
+
 ## Requirements
 
 | Requirement | Version |
