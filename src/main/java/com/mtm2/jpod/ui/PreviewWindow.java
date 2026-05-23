@@ -5,12 +5,13 @@ import com.mtm2.jpod.io.pod.PodArchive;
 
 import javax.imageio.ImageIO;
 import javax.swing.*;
-import javax.swing.text.JTextComponent;
 import java.awt.*;
 import java.awt.image.BufferedImage;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
 
@@ -37,6 +38,7 @@ public final class PreviewWindow extends JFrame {
 
     private static final int MAX_PREVIEW_W = 1024;
     private static final int MAX_PREVIEW_H = 768;
+    private boolean previewCancelled;
 
     /**
      * Creates and lays out the preview window for the given archive entry.
@@ -79,18 +81,27 @@ public final class PreviewWindow extends JFrame {
         setLocationRelativeTo(owner);
     }
 
+    public boolean isPreviewCancelled() {
+        return previewCancelled;
+    }
+
     // -------------------------------------------------------------------------
     // RAW / CLR image
     // -------------------------------------------------------------------------
 
     private void buildRawImagePanel(String entryName, byte[] data, PodArchive archive) {
         int[] dims = RawImageDecoder.detectDimensions(data.length);
+        int[] palette = resolvePalette(entryName, archive);
         if (dims == null) {
-            buildUnsupported("Cannot determine dimensions for RAW file (size=" + data.length + ").");
-            return;
+            RawPreviewOptions options = promptForRawDimensions(entryName, data.length, archive);
+            if (options == null) {
+                previewCancelled = true;
+                return;
+            }
+            dims = options.dimensions();
+            palette = options.palette();
         }
 
-        int[] palette = resolvePalette(entryName, archive);
         BufferedImage img = RawImageDecoder.decodeRaw(data, palette, dims[0], dims[1]);
 
         // Scale up small textures so they're easy to see
@@ -99,15 +110,194 @@ public final class PreviewWindow extends JFrame {
         buildImagePanel(img);
     }
 
+    private RawPreviewOptions promptForRawDimensions(String entryName, int byteCount, PodArchive archive) {
+        List<int[]> suggestions = RawImageDecoder.suggestDimensions(byteCount);
+        int[] preferredDims = preferredDimensions(byteCount, suggestions);
+        PaletteChoices palettes = resolvePaletteChoices(entryName, archive);
+
+        JPanel panel = new JPanel(new BorderLayout(0, 8));
+        panel.add(new JLabel("<html>Select dimensions for <b>" + entryName + "</b><br>"
+                + "RAW payload size: " + byteCount + " bytes</html>"), BorderLayout.NORTH);
+
+        JPanel form = new JPanel(new GridBagLayout());
+        GridBagConstraints gbc = new GridBagConstraints();
+        gbc.insets = new Insets(2, 2, 2, 2);
+        gbc.anchor = GridBagConstraints.WEST;
+
+        JComboBox<DimensionChoice> choices = new JComboBox<>();
+        for (int[] suggestion : suggestions) {
+            choices.addItem(new DimensionChoice(suggestion[0], suggestion[1]));
+            if (choices.getItemCount() == 12) {
+                break;
+            }
+        }
+
+        JSpinner widthSpinner = new JSpinner(new SpinnerNumberModel(
+                preferredDims[0], 1, Math.max(1, byteCount), 1));
+        JSpinner heightSpinner = new JSpinner(new SpinnerNumberModel(
+                preferredDims[1], 1, Math.max(1, byteCount), 1));
+        JButton swapButton = new JButton("Swap");
+        JComboBox<PaletteChoice> paletteCombo = new JComboBox<>(palettes.choices().toArray(PaletteChoice[]::new));
+        paletteCombo.setSelectedIndex(Math.max(0, palettes.defaultIndex()));
+
+        choices.addActionListener(event -> {
+            DimensionChoice selected = (DimensionChoice) choices.getSelectedItem();
+            if (selected != null) {
+                widthSpinner.setValue(selected.width());
+                heightSpinner.setValue(selected.height());
+            }
+        });
+        swapButton.addActionListener(event -> {
+            Object width = widthSpinner.getValue();
+            widthSpinner.setValue(heightSpinner.getValue());
+            heightSpinner.setValue(width);
+        });
+
+        gbc.gridx = 0;
+        gbc.gridy = 0;
+        form.add(new JLabel("Suggested sizes:"), gbc);
+        gbc.gridx = 1;
+        form.add(choices, gbc);
+
+        gbc.gridx = 0;
+        gbc.gridy = 1;
+        form.add(new JLabel("Width:"), gbc);
+        gbc.gridx = 1;
+        form.add(widthSpinner, gbc);
+
+        gbc.gridx = 0;
+        gbc.gridy = 2;
+        form.add(new JLabel("Height:"), gbc);
+        gbc.gridx = 1;
+        form.add(heightSpinner, gbc);
+
+        gbc.gridx = 1;
+        gbc.gridy = 3;
+        form.add(swapButton, gbc);
+
+        gbc.gridx = 0;
+        gbc.gridy = 4;
+        form.add(new JLabel("Palette:"), gbc);
+        gbc.gridx = 1;
+        form.add(paletteCombo, gbc);
+
+        panel.add(form, BorderLayout.CENTER);
+
+        while (true) {
+            int result = JOptionPane.showConfirmDialog(
+                    this,
+                    panel,
+                    "RAW Dimensions",
+                    JOptionPane.OK_CANCEL_OPTION,
+                    JOptionPane.PLAIN_MESSAGE);
+            if (result != JOptionPane.OK_OPTION) {
+                return null;
+            }
+            int width = ((Number) widthSpinner.getValue()).intValue();
+            int height = ((Number) heightSpinner.getValue()).intValue();
+            long required = (long) width * height;
+            if (width <= 0 || height <= 0) {
+                JOptionPane.showMessageDialog(
+                        this,
+                        "Width and height must be positive.",
+                        "RAW Dimensions",
+                        JOptionPane.WARNING_MESSAGE);
+                continue;
+            }
+            if (required != byteCount) {
+                JOptionPane.showMessageDialog(
+                        this,
+                        "Width × height must exactly match the RAW size.\n"
+                                + width + " × " + height + " = " + required
+                                + " bytes, expected " + byteCount + ".",
+                        "RAW Dimensions",
+                        JOptionPane.WARNING_MESSAGE);
+                continue;
+            }
+            PaletteChoice paletteChoice = (PaletteChoice) paletteCombo.getSelectedItem();
+            return new RawPreviewOptions(
+                    new int[]{width, height},
+                    paletteChoice != null ? paletteChoice.palette() : RawImageDecoder.loadResourcePalette());
+        }
+    }
+
+    private PaletteChoices resolvePaletteChoices(String entryName, PodArchive archive) {
+        List<PaletteChoice> choices = new ArrayList<>();
+        int defaultIndex = -1;
+        if (archive != null) {
+            int dot = entryName.lastIndexOf('.');
+            if (dot > 0) {
+                String sameNameAct = entryName.substring(0, dot) + ".act";
+                Optional<PodArchive.Entry> sameNameEntry = archive.findEntry(sameNameAct);
+                if (sameNameEntry.isPresent()) {
+                    choices.add(new PaletteChoice(
+                            "Same-name ACT: " + sameNameEntry.get().name(),
+                            tryDecodeAct(archive.getEntryBytes(sameNameEntry.get()))));
+                    defaultIndex = 0;
+                }
+            }
+
+            Optional<PodArchive.Entry> vga = findArchivePalette(archive, "VGA.ACT");
+            if (vga.isPresent()) {
+                choices.add(new PaletteChoice("VGA.ACT", tryDecodeAct(archive.getEntryBytes(vga.get()))));
+                if (defaultIndex < 0) {
+                    defaultIndex = choices.size() - 1;
+                }
+            }
+
+            for (PodArchive.Entry entry : archive.getEntries()) {
+                String upperName = entry.name().toUpperCase(Locale.ROOT);
+                if (!upperName.endsWith(".ACT")) {
+                    continue;
+                }
+                if (upperName.endsWith("METALCR2.ACT") || upperName.endsWith("VGA.ACT")) {
+                    continue;
+                }
+                choices.add(new PaletteChoice("Archive ACT: " + entry.name(), tryDecodeAct(archive.getEntryBytes(entry))));
+            }
+
+            Optional<PodArchive.Entry> metalcr = findArchivePalette(archive, "METALCR2.ACT");
+            if (metalcr.isPresent()) {
+                choices.add(new PaletteChoice("METALCR2.ACT", tryDecodeAct(archive.getEntryBytes(metalcr.get()))));
+            }
+        }
+        int greyscaleIndex = choices.size();
+        choices.add(new PaletteChoice("Greyscale", RawImageDecoder.greyscalePalette()));
+        if (defaultIndex < 0) {
+            defaultIndex = greyscaleIndex;
+        }
+        if (choices.stream().noneMatch(choice -> choice.label().equals("METALCR2.ACT"))) {
+            choices.add(new PaletteChoice("Bundled METALCR2.ACT", RawImageDecoder.loadResourcePalette()));
+        }
+        return new PaletteChoices(List.copyOf(choices), defaultIndex);
+    }
+
+    private int[] preferredDimensions(int byteCount, List<int[]> suggestions) {
+        if (byteCount == 256000) {
+            return new int[]{640, 400};
+        }
+        if (byteCount == 64000) {
+            return new int[]{320, 200};
+        }
+        if (byteCount == 307200) {
+            return new int[]{640, 480};
+        }
+        if (!suggestions.isEmpty()) {
+            return suggestions.get(0);
+        }
+        return new int[]{byteCount, 1};
+    }
+
     /**
      * Resolves the palette for a .raw / .clr file, in priority order:
      *
      * 1. Same base-name .act in the archive  (demo1.raw  → demo1.act,
      *                                          ART\W01.RAW → ART\W01.ACT)
      * 2. Any other .act in the same archive directory
-     * 3. METALCR2.ACT anywhere in the archive (MTM1 default)
-     * 4. metalcr2.act bundled as a classpath resource  (src/main/resources/palettes/)
-     * 5. Greyscale fallback
+     * 3. VGA.ACT anywhere in the archive
+     * 4. METALCR2.ACT anywhere in the archive (MTM1 default)
+     * 5. metalcr2.act bundled as a classpath resource  (src/main/resources/palettes/)
+     * 6. Greyscale fallback
      */
     private static int[] resolvePalette(String entryName, PodArchive archive) {
 
@@ -132,13 +322,25 @@ public final class PreviewWindow extends JFrame {
                 }
             }
 
-            // 3. METALCR2.ACT anywhere in the archive
-            Optional<PodArchive.Entry> metalcr = archive.findEntry("METALCR2.ACT");
+            // 3. VGA.ACT anywhere in the archive
+            Optional<PodArchive.Entry> vga = findArchivePalette(archive, "VGA.ACT");
+            if (vga.isPresent()) return tryDecodeAct(archive.getEntryBytes(vga.get()));
+
+            // 4. METALCR2.ACT anywhere in the archive
+            Optional<PodArchive.Entry> metalcr = findArchivePalette(archive, "METALCR2.ACT");
             if (metalcr.isPresent()) return tryDecodeAct(archive.getEntryBytes(metalcr.get()));
         }
 
-        // 4. Classpath resource (src/main/resources/palettes/metalcr2.act)
+        // 5. Classpath resource (src/main/resources/palettes/metalcr2.act)
         return RawImageDecoder.loadResourcePalette();
+    }
+
+    private static Optional<PodArchive.Entry> findArchivePalette(PodArchive archive, String fileName) {
+        Optional<PodArchive.Entry> entry = archive.findEntry(fileName);
+        if (entry.isPresent()) {
+            return entry;
+        }
+        return archive.findEntryByTitle(fileName);
     }
 
     private static int[] tryDecodeAct(byte[] bytes) {
@@ -312,5 +514,25 @@ public final class PreviewWindow extends JFrame {
         g.drawImage(src, 0, 0, w, h, null);
         g.dispose();
         return out;
+    }
+
+    private record DimensionChoice(int width, int height) {
+        @Override
+        public String toString() {
+            return width + " x " + height;
+        }
+    }
+
+    private record PaletteChoice(String label, int[] palette) {
+        @Override
+        public String toString() {
+            return label;
+        }
+    }
+
+    private record RawPreviewOptions(int[] dimensions, int[] palette) {
+    }
+
+    private record PaletteChoices(List<PaletteChoice> choices, int defaultIndex) {
     }
 }

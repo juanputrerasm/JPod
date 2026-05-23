@@ -3,13 +3,13 @@ package com.mtm2.jpod.ui;
 import javax.swing.*;
 import java.awt.*;
 
-/** About dialog — displays application name, description, and package info. */
+/** About dialog — displays application name, description, and version info. */
 public final class AboutDialog extends JDialog {
 
     public AboutDialog(Frame owner) {
         super(owner, "About JPod", true);
 
-        JLabel title = new JLabel("JPod v1.0", SwingConstants.CENTER);
+        JLabel title = new JLabel("JPod v1.1", SwingConstants.CENTER);
         title.setFont(title.getFont().deriveFont(Font.BOLD, 22f));
 
         JLabel subtitle = new JLabel(

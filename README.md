@@ -7,9 +7,12 @@ A Java 17 desktop tool for viewing, extracting, and building Terminal Reality **
 ## Features
 
 ### Archive viewing
-- Open any `.pod` file and browse its directory in a sortable Name / Size / Offset table.
+- Open any `.pod` file and browse its contents in a file-viewer style table with Name / Size / Description columns.
+- Archive folders and subfolders are shown with icons and start collapsed by default, so root files and top-level folders are easier to scan.
+- Click column headers to sort by name, size, or description; clicking again reverses the sort, and a third click returns to the default archive order.
+- Use the quick search field above the table to filter visible entries instantly, or open the Advanced search dialog for targeted searches and jump-to selection.
 - The archive comment (80-char POD header field) is shown in an editable field below the toolbar.
-- Search entries by name substring or file size.
+- JPod keeps a list of the 10 most recently opened files in a per-user JSON config stored in the operating system's preferences/config location.
 
 ### Extraction
 - **Extract All** — writes every entry to a chosen folder, recreating the archive's subfolder structure automatically.
@@ -17,7 +20,7 @@ A Java 17 desktop tool for viewing, extracting, and building Terminal Reality **
 
 ### Archive building & editing
 - **New Archive** — start an empty archive from scratch.
-- **Open Manifest** — load a `.lst` text file (one filename per line) and resolve each file from disk to build the entry list. Supports an optional `filename,archiveName` syntax per line.
+- **Open Response List File** — load a `.lst` text file (one filename per line) and resolve each file from disk to build the entry list. Supports an optional `filename,archiveName` syntax per line.
 - **Add Files** — append individual files via a file picker or by **drag-and-dropping** files directly onto the entry table.
 - **Remove** — delete selected entries from the in-memory list.
 - **Replace** (right-click) — swap a single entry's data with a file from disk, keeping the original archive name.
@@ -32,23 +35,34 @@ Double-click any entry (or press Preview from the right-click menu) to open a ty
 
 | Extension | Preview |
 |---|---|
-| `.raw`, `.clr` | 8-bit paletted image decoded with the matched `.act` palette (see [Palette resolution](#palette-resolution)). Art textures (64×64) are shown at 4× zoom. |
+| `.raw`, `.clr` | 8-bit paletted image decoded with the matched `.act` palette (see [Palette resolution](#palette-resolution)). Art textures (64×64) are shown at 4× zoom. Non-standard RAW sizes can be previewed by selecting width, height, and palette manually. |
 | `.act` | 16×16 colour swatch grid; hover shows the index and hex value. |
 | `.wav` | PCM audio player (play / pause / stop, position readout). |
 | `.bmp`, `.png`, `.jpg`, … | Standard images via `javax.imageio`. |
-| `.txt`, `.def`, `.nav`, `.lvl`, `.sit`, `.lst`, `.ini`, `.cfg`, and other text formats | Scrollable monospaced text viewer. |
+| `.txt`, `.def`, `.nav`, `.lvl`, `.sit`, `.lst`, `.ini`, `.cfg`, `.tex`, `.tnl`, `.ttx`, `.trk`, `.trn`, `.ndx`, `.mic`, and other text formats | Scrollable monospaced text viewer. |
 | Anything else | Hex dump of the first 4 096 bytes. |
 
 #### Palette resolution
 For `.raw` and `.clr` files, the palette is resolved in this order:
 1. Same base name in the same archive directory (e.g. `ART\DEMO1.RAW` → `ART\DEMO1.ACT`)
-2. Any other `.act` file in the same archive subdirectory
+2. `VGA.ACT` anywhere in the archive
 3. `METALCR2.ACT` anywhere in the archive (MTM1 default palette)
-4. `metalcr2.act` bundled as a classpath resource (`src/main/resources/palettes/`)
-5. Greyscale fallback
+4. Any other `.act` file in the archive
+5. `metalcr2.act` bundled as a classpath resource (`src/main/resources/palettes/`)
+6. Greyscale fallback
+
+When a RAW file does not match the common built-in sizes, JPod offers a preview dialog where you can:
+- choose width and height manually
+- swap width and height instantly
+- choose a palette from the same-name ACT, ACT files inside the POD, `VGA.ACT`, `METALCR2.ACT`, or greyscale
+
+Common non-square defaults are preselected automatically:
+- `64000` bytes -> `320 x 200`
+- `256000` bytes -> `640 x 400`
+- `307200` bytes -> `640 x 480`
 
 ### Mount in pod.ini
-Adds the open archive to the game's `pod.ini` mount list (32-POD maximum). Searches the archive's folder and its parent; detects duplicates and a full list.
+Adds the open archive to the game's `pod.ini` mount list. JPod uses `99` as the recommended limit, warns when the list is already larger, and still mounts the POD instead of blocking the action. It searches the archive's folder and its parent and detects duplicates.
 
 ---
 
@@ -85,7 +99,7 @@ java -jar target/jpod.jar
 ## Project layout
 
 ```
-src/main/java/com/mtm2/winpod/
+src/main/java/com/mtm2/jpod/
 ├── JPodApp.java               Entry point
 ├── PodSession.java            Shared mutable state for the current archive
 ├── io/

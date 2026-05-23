@@ -1,6 +1,9 @@
 package com.mtm2.jpod.io;
 
 import java.awt.image.BufferedImage;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
 
 /**
  * Decodes Terminal Reality raw image and palette formats.
@@ -10,7 +13,8 @@ import java.awt.image.BufferedImage;
  *   Dimensions are inferred from the file size:
  *     4 096 bytes → 64 × 64  (art texture)
  *    65 536 bytes → 256 × 256  (heightmap / colour-lookup-table / CLR)
- *   Any other size falls back to the largest square that fits.
+ *   Exact-square payloads fall back to {@code side × side}. Non-square payloads
+ *   require the caller to choose dimensions explicitly.
  *
  * ACT format (art\*.act):
  *   768 bytes = 256 colours × 3 bytes (R, G, B).
@@ -142,6 +146,28 @@ public final class RawImageDecoder {
     }
 
     /**
+     * Returns exact width/height pairs whose product matches {@code byteCount},
+     * ordered from most square-like to most elongated.
+     */
+    public static List<int[]> suggestDimensions(int byteCount) {
+        List<int[]> suggestions = new ArrayList<>();
+        if (byteCount <= 0) {
+            return suggestions;
+        }
+        for (int width = 1; width * width <= byteCount; width++) {
+            if (byteCount % width != 0) {
+                continue;
+            }
+            int height = byteCount / width;
+            suggestions.add(new int[]{width, height});
+        }
+        suggestions.sort(Comparator
+                .comparingInt((int[] dims) -> Math.abs(dims[0] - dims[1]))
+                .thenComparingInt(dims -> Math.max(dims[0], dims[1])));
+        return suggestions;
+    }
+
+    /**
      * Returns {@code true} if the given filename (case-insensitive) has a raw image
      * extension supported by this decoder.
      */
@@ -165,7 +191,9 @@ public final class RawImageDecoder {
         return upper.endsWith(".TXT") || upper.endsWith(".DEF") || upper.endsWith(".NAV")
                 || upper.endsWith(".TDF") || upper.endsWith(".TEX") || upper.endsWith(".LVL")
                 || upper.endsWith(".INI") || upper.endsWith(".LST") || upper.endsWith(".INF")
-                || upper.endsWith(".CFG") || upper.endsWith(".VOX") || upper.endsWith(".SIT");
+                || upper.endsWith(".CFG") || upper.endsWith(".VOX") || upper.endsWith(".SIT")
+                || upper.endsWith(".TRN") || upper.endsWith(".NDX") || upper.endsWith(".TNL")
+                || upper.endsWith(".TTX") || upper.endsWith(".TRK");
     }
 
     /**
