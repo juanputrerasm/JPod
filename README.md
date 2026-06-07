@@ -1,7 +1,7 @@
 # JPod: Terminal Reality POD archive utility
 
 A Java 17 desktop tool for viewing, extracting, and building Terminal Reality **POD** (version 1) archives, the proprietary container format used by games including *Monster Truck Madness 1 & 2*, *CART Precision Racing*, *Hellbender*, *Terminal Velocity*, and *Fury3*. 
-JPod also includes read-only support for `POD2` (*Nocture*, *4x4 Evo 1 & 2*) and `EPD` (*Fly!*) archives for browsing, previewing, and extraction.
+JPod also includes read-only support for `POD2` (*Nocturne*, *4x4 Evo 1 & 2*) and `EPD` (*Fly!*) archives for browsing, previewing, and extraction.
 
 ---
 
