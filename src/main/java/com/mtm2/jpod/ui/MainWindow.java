@@ -168,7 +168,7 @@ public final class MainWindow extends JFrame {
 
         JPanel browserBar = new JPanel(new BorderLayout(8, 0));
         browserBar.setBorder(BorderFactory.createEmptyBorder(0, 4, 2, 4));
-        browserBar.add(new JLabel("Quick Search:"), BorderLayout.WEST);
+        browserBar.add(new JLabel("File filter: "), BorderLayout.WEST);
         browserBar.add(quickSearchField, BorderLayout.CENTER);
         JButton advancedSearchButton = new JButton("Advanced");
         advancedSearchButton.addActionListener(event -> onSearch());

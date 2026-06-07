@@ -29,7 +29,7 @@ import java.util.Optional;
 public final class PodArchive {
 
     public enum Format {
-        POD1("POD"),
+        POD1("POD1"),
         POD2("POD2"),
         EPD("EPD");
 
