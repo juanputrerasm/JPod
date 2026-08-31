@@ -454,25 +454,32 @@ public final class MainWindow extends JFrame {
         String savedComment = archiveComment;
         List<EditableEntry> snapshot = List.copyOf(editableEntries);
         setBusy(true);
-        new SwingWorker<Void, Void>() {
-            @Override protected Void doInBackground() throws Exception {
+        new SwingWorker<PodArchive.Format, Void>() {
+            @Override protected PodArchive.Format doInBackground() throws Exception {
                 List<PodArchiveWriter.Blob> blobs = new ArrayList<>(snapshot.size());
                 for (EditableEntry e : snapshot) {
                     blobs.add(new PodArchiveWriter.Blob(e.name(), e.data()));
                 }
-                new PodArchiveWriter().write(target, savedComment, blobs);
-                return null;
+                return new PodArchiveWriter().write(target, savedComment, blobs);
             }
             @Override protected void done() {
                 setBusy(false);
                 try {
-                    get();
+                    PodArchive.Format written = get();
                     dirty = false;
                     updateDirtyLabel();
                     session.setTargetFolderPath(target.getParent());
                     session.setTargetFileName(target.getFileName().toString());
-                    progressLabel.setText("Saved: " + target.getFileName());
+                    progressLabel.setText("Saved: " + target.getFileName()
+                            + " (" + written.displayName() + ")");
                     setTitle(TITLE + " - " + target.getFileName());
+                    if (written == PodArchive.Format.POD1_64) {
+                        JOptionPane.showMessageDialog(MainWindow.this,
+                                "This archive contains entry names longer than 31 characters, "
+                                + "so it was written with the 64-byte POD1 directory.\n"
+                                + "Only updated engines and tools can open it.",
+                                TITLE, JOptionPane.INFORMATION_MESSAGE);
+                    }
                 } catch (Exception ex) {
                     showError("Save failed", ex);
                 }

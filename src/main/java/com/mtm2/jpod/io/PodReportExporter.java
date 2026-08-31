@@ -42,6 +42,7 @@ public final class PodReportExporter {
      *
      *   Filename                     File Size      File Offset
      *   &lt;name padded to col 30&gt;      &lt;size col 30&gt;  &lt;offset col 45&gt;
+     *   (a name wider than its column shifts the later columns right)
      *   …
      * </pre>
      *
@@ -68,19 +69,32 @@ public final class PodReportExporter {
             w.newLine();
 
             for (PodArchive.Entry entry : entries) {
-                // Build an 80-char padded line: name left-justified, size at col 30, offset at col 45
-                StringBuilder line = new StringBuilder(80);
-                String name = entry.name().replace('\0', ' ').strip();
-                line.append(name);
-                while (line.length() < 30) line.append(' ');
-                String size = String.valueOf(entry.length());
-                line.replace(30, 30 + size.length(), size);
-                while (line.length() < 45) line.append(' ');
-                String offset = String.valueOf(entry.offset());
-                line.replace(45, 45 + offset.length(), offset);
+                // Name left-justified, size at col 30, offset at col 45. A POD1-64
+                // name can be wider than its column, in which case the remaining
+                // columns shift right instead of overwriting the name.
+                StringBuilder line = new StringBuilder(96);
+                line.append(entry.name().replace('\0', ' ').strip());
+                padTo(line, 30);
+                line.append(entry.length());
+                padTo(line, 45);
+                line.append(entry.offset());
                 w.write(line.toString().stripTrailing());
                 w.newLine();
             }
+        }
+    }
+
+    /**
+     * Pads {@code line} with spaces up to {@code column}, or appends a single
+     * separating space when the content already reaches past it.
+     */
+    private static void padTo(StringBuilder line, int column) {
+        if (line.length() >= column) {
+            line.append(' ');
+            return;
+        }
+        while (line.length() < column) {
+            line.append(' ');
         }
     }
 

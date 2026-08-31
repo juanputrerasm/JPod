@@ -13,7 +13,7 @@ import java.util.Optional;
  * <pre>
  *   Offset   Size   Description
  *   ------   ----   -----------
- *        0      4   Item count (uint32)
+ *        0      4   Item count (int32)
  *        4     80   Archive comment (null-terminated ISO-8859-1 string)
  *       84  N × 40  Directory table — one {@link Entry} per item:
  *                     +  0  32 bytes  Entry name (null-padded)
@@ -22,6 +22,18 @@ import java.util.Optional;
  *   84+N×40   …    Raw file data, concatenated in directory order
  * </pre>
  *
+ * <p>The Community Patch 3 extension known as <em>POD1-64</em> keeps the same
+ * 84-byte header but widens the directory name field from 32 to 64 bytes, so
+ * each record is 72 bytes instead of 40:
+ * <pre>
+ *       84  N × 72  Directory table — one {@link Entry} per item:
+ *                     +  0  64 bytes  Entry name (null-padded)
+ *                     + 64   4 bytes  Data length (uint32)
+ *                     + 68   4 bytes  Data offset from file start (uint32)
+ * </pre>
+ * Nothing else changes: the payload is still a concatenation of byte ranges
+ * addressed by each entry's offset and length.
+ *
  * <p>Instances are created exclusively by {@link PodArchiveReader}. The raw
  * file bytes are kept in memory so that individual entry data can be sliced
  * out cheaply via {@link #getEntryBytes(Entry)}.
@@ -29,7 +41,10 @@ import java.util.Optional;
 public final class PodArchive {
 
     public enum Format {
+        /** Classic POD version 1: 84-byte header, 40-byte directory records, 31-byte names. */
         POD1("POD1"),
+        /** POD1-64: 84-byte header, 72-byte directory records, 63-byte names. */
+        POD1_64("Extended POD1"),
         POD2("POD2"),
         EPD("EPD");
 
@@ -58,6 +73,14 @@ public final class PodArchive {
 
     public Format getFormat() {
         return format;
+    }
+
+    /**
+     * Returns {@code true} for archives of the POD version 1 family, that is
+     * classic {@link Format#POD1} and extended {@link Format#POD1_64}.
+     */
+    public boolean isPod1Family() {
+        return format == Format.POD1 || format == Format.POD1_64;
     }
 
     /** Returns the 80-character archive comment from the POD header (trimmed). */
