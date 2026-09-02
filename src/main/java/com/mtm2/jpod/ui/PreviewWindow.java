@@ -22,8 +22,9 @@ import java.util.Optional;
  *   <tr><th>Extension(s)</th><th>Display mode</th></tr>
  *   <tr><td>{@code .raw}, {@code .clr}</td>
  *       <td>8-bit paletted image (64×64 art texture or 256×256 heightmap / CLR).
- *           Palette resolved via {@link #resolvePalette}: same-name {@code .act} →
- *           directory sibling → {@code METALCR2.ACT} in archive →
+ *           Palette resolved via {@link #resolvePalette}: the palette named in the
+ *           entry's own POD directory field, then same-name {@code .act} →
+ *           directory sibling → {@code VGA.ACT} → {@code METALCR2.ACT} in archive →
  *           classpath resource → greyscale.</td></tr>
  *   <tr><td>{@code .act}</td><td>256-colour VGA palette swatch grid (16×16).</td></tr>
  *   <tr><td>{@code .wav}</td><td>Delegates to {@link AudioPlayerDialog}.</td></tr>
@@ -34,7 +35,7 @@ import java.util.Optional;
  *   <tr><td>anything else</td><td>Hex dump of the first 4 096 bytes.</td></tr>
  * </table>
  */
-public final class PreviewWindow extends JFrame {
+public final class PreviewWindow extends JDialog {
 
     private static final int MAX_PREVIEW_W = 1024;
     private static final int MAX_PREVIEW_H = 768;
@@ -51,15 +52,22 @@ public final class PreviewWindow extends JFrame {
      *                   for {@code .raw} / {@code .clr} files; may be {@code null}
      */
     public PreviewWindow(Frame owner, String entryName, byte[] data, PodArchive archive) {
-        super("Preview — " + entryName);
-        setDefaultCloseOperation(JFrame.DISPOSE_ON_CLOSE);
+        this(owner, entryName, data, archive, null);
+    }
+
+    /**
+     * @param nameField the entry's POD directory field, when the caller has it;
+     *                  it is what lets the stored palette name be used
+     */
+    public PreviewWindow(Frame owner, String entryName, byte[] data, PodArchive archive,
+            byte[] nameField) {
+        super(owner, "Preview - " + entryName, true);
+        setDefaultCloseOperation(WindowConstants.DISPOSE_ON_CLOSE);
 
         String upper = entryName.toUpperCase(Locale.ROOT);
 
-        if (upper.endsWith(".WAV")) {
-            buildAudioPanel(owner, entryName, data);
-        } else if (RawImageDecoder.isRawImage(upper)) {
-            buildRawImagePanel(entryName, data, archive);
+        if (RawImageDecoder.isRawImage(upper)) {
+            buildRawImagePanel(entryName, data, archive, nameField);
         } else if (RawImageDecoder.isActPalette(upper)) {
             buildActPalettePanel(entryName, data);
         } else if (RawImageDecoder.isTextFile(upper)) {
@@ -81,6 +89,30 @@ public final class PreviewWindow extends JFrame {
         setLocationRelativeTo(owner);
     }
 
+    /**
+     * Opens the right window for an entry and blocks until it is closed.
+     *
+     * <p>A {@code .wav} goes straight to {@link AudioPlayerDialog}. Routing it
+     * here rather than inside the constructor is what lets this window be modal:
+     * the old placeholder frame disposed itself from an {@code invokeLater} that
+     * a modal dialog's nested event loop would have run at the wrong moment.
+     */
+    public static void open(Frame owner, String entryName, byte[] data, PodArchive archive,
+            byte[] nameField) {
+        if (entryName.toUpperCase(Locale.ROOT).endsWith(".WAV")) {
+            new AudioPlayerDialog(owner, entryName, data).setVisible(true);
+            return;
+        }
+
+        PreviewWindow window = new PreviewWindow(owner, entryName, data, archive, nameField);
+        if (window.isPreviewCancelled()) {
+            window.dispose();
+            return;
+        }
+
+        window.setVisible(true);
+    }
+
     public boolean isPreviewCancelled() {
         return previewCancelled;
     }
@@ -89,11 +121,12 @@ public final class PreviewWindow extends JFrame {
     // RAW / CLR image
     // -------------------------------------------------------------------------
 
-    private void buildRawImagePanel(String entryName, byte[] data, PodArchive archive) {
+    private void buildRawImagePanel(String entryName, byte[] data, PodArchive archive,
+            byte[] nameField) {
         int[] dims = RawImageDecoder.detectDimensions(data.length);
-        int[] palette = resolvePalette(entryName, archive);
+        int[] palette = resolvePalette(entryName, archive, nameField);
         if (dims == null) {
-            RawPreviewOptions options = promptForRawDimensions(entryName, data.length, archive);
+            RawPreviewOptions options = promptForRawDimensions(entryName, data.length, archive, nameField);
             if (options == null) {
                 previewCancelled = true;
                 return;
@@ -110,10 +143,11 @@ public final class PreviewWindow extends JFrame {
         buildImagePanel(img);
     }
 
-    private RawPreviewOptions promptForRawDimensions(String entryName, int byteCount, PodArchive archive) {
+    private RawPreviewOptions promptForRawDimensions(String entryName, int byteCount,
+            PodArchive archive, byte[] nameField) {
         List<int[]> suggestions = RawImageDecoder.suggestDimensions(byteCount);
         int[] preferredDims = preferredDimensions(byteCount, suggestions);
-        PaletteChoices palettes = resolvePaletteChoices(entryName, archive);
+        PaletteChoices palettes = resolvePaletteChoices(entryName, archive, nameField);
 
         JPanel panel = new JPanel(new BorderLayout(0, 8));
         panel.add(new JLabel("<html>Select dimensions for <b>" + entryName + "</b><br>"
@@ -221,10 +255,19 @@ public final class PreviewWindow extends JFrame {
         }
     }
 
-    private PaletteChoices resolvePaletteChoices(String entryName, PodArchive archive) {
+    private PaletteChoices resolvePaletteChoices(String entryName, PodArchive archive,
+            byte[] nameField) {
         List<PaletteChoice> choices = new ArrayList<>();
         int defaultIndex = -1;
         if (archive != null) {
+            Optional<PodArchive.Entry> stored = findStoredPalette(archive, nameField);
+            if (stored.isPresent()) {
+                choices.add(new PaletteChoice(
+                        "Stored in the archive: " + stored.get().name(),
+                        tryDecodeAct(archive.getEntryBytes(stored.get()))));
+                defaultIndex = 0;
+            }
+
             int dot = entryName.lastIndexOf('.');
             if (dot > 0) {
                 String sameNameAct = entryName.substring(0, dot) + ".act";
@@ -233,7 +276,9 @@ public final class PreviewWindow extends JFrame {
                     choices.add(new PaletteChoice(
                             "Same-name ACT: " + sameNameEntry.get().name(),
                             tryDecodeAct(archive.getEntryBytes(sameNameEntry.get()))));
-                    defaultIndex = 0;
+                    if (defaultIndex < 0) {
+                        defaultIndex = choices.size() - 1;
+                    }
                 }
             }
 
@@ -299,9 +344,16 @@ public final class PreviewWindow extends JFrame {
      * 5. metalcr2.act bundled as a classpath resource  (src/main/resources/palettes/)
      * 6. Greyscale fallback
      */
-    private static int[] resolvePalette(String entryName, PodArchive archive) {
+    private static int[] resolvePalette(String entryName, PodArchive archive, byte[] nameField) {
 
         if (archive != null) {
+            // 0. The palette the packer recorded for this very entry. Where it
+            //    exists it beats every guess below: on MTM1, TV, Fury3 and
+            //    Hellbender the same-directory rule picks whichever ACT happens
+            //    to come first in the archive, which is almost never the right one.
+            Optional<PodArchive.Entry> stored = findStoredPalette(archive, nameField);
+            if (stored.isPresent()) return tryDecodeAct(archive.getEntryBytes(stored.get()));
+
             // 1. Same base-name .act  (strip extension, append .act)
             int dot = entryName.lastIndexOf('.');
             if (dot > 0) {
@@ -333,6 +385,18 @@ public final class PreviewWindow extends JFrame {
 
         // 5. Classpath resource (src/main/resources/palettes/metalcr2.act)
         return RawImageDecoder.loadResourcePalette();
+    }
+
+    /**
+     * Returns the archive entry for the palette named in a directory field, or
+     * empty when the field names none or the archive does not hold it.
+     */
+    private static Optional<PodArchive.Entry> findStoredPalette(PodArchive archive, byte[] nameField) {
+        String palette = PodArchive.Entry.secondString(nameField);
+        if (palette == null || !palette.toUpperCase(Locale.ROOT).endsWith(".ACT")) {
+            return Optional.empty();
+        }
+        return findArchivePalette(archive, palette);
     }
 
     private static Optional<PodArchive.Entry> findArchivePalette(PodArchive archive, String fileName) {
@@ -439,20 +503,6 @@ public final class PreviewWindow extends JFrame {
     // Audio
     // -------------------------------------------------------------------------
 
-    private void buildAudioPanel(Frame owner, String entryName, byte[] data) {
-        // Delegate to the dedicated player dialog and show a minimal placeholder here
-        setLayout(new BorderLayout());
-        JLabel lbl = new JLabel("Launching audio player…", SwingConstants.CENTER);
-        lbl.setFont(lbl.getFont().deriveFont(Font.ITALIC));
-        add(lbl);
-        setSize(280, 80);
-
-        SwingUtilities.invokeLater(() -> {
-            dispose(); // close the placeholder
-            new AudioPlayerDialog(owner, entryName, data).setVisible(true);
-        });
-    }
-
     // -------------------------------------------------------------------------
     // Hex dump fallback
     // -------------------------------------------------------------------------
@@ -461,7 +511,7 @@ public final class PreviewWindow extends JFrame {
         int limit = Math.min(data.length, 4096);
         StringBuilder sb = new StringBuilder();
         sb.append(String.format(
-                "Binary data — first %d of %d bytes%n%n", limit, data.length));
+                "Binary data - first %d of %d bytes%n%n", limit, data.length));
         for (int i = 0; i < limit; i += 16) {
             sb.append(String.format("%06X  ", i));
             for (int j = i; j < Math.min(i + 16, limit); j++) {

@@ -20,7 +20,7 @@ public final class BuildArchiveDialog extends JDialog {
     private boolean confirmed;
 
     public BuildArchiveDialog(Frame owner, PodSession session) {
-        super(owner, "JPod — Make Archive", true);
+        super(owner, "Make Archive", true);
 
         if (session.getSourceFolderPath() != null) {
             folderField.setText(session.getSourceFolderPath().toString());

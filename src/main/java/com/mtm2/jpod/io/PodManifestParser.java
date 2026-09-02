@@ -21,6 +21,10 @@ import java.util.List;
  */
 public final class PodManifestParser {
 
+    /** Parsed PODTool response-file metadata plus the resolved archive entries. */
+    public record Manifest(String podFileName, String volumeName,
+                           List<PodArchiveWriter.Blob> blobs) {}
+
     /**
      * Parses {@code manifestPath} and resolves each entry's bytes from disk.
      *
@@ -36,14 +40,28 @@ public final class PodManifestParser {
      * @throws IOException if any listed source file cannot be read
      */
     public List<PodArchiveWriter.Blob> parse(Path manifestPath, Path sourceFolder) throws IOException {
+        return parseManifest(manifestPath, sourceFolder).blobs();
+    }
+
+    public Manifest parseManifest(Path manifestPath, Path sourceFolder) throws IOException {
         List<String> lines = Files.readAllLines(manifestPath);
         List<PodArchiveWriter.Blob> blobs = new ArrayList<>();
+        String podFileName = "noname.pod";
+        String volumeName = "";
 
         Path parentFolder = sourceFolder.getParent();
 
         for (String raw : lines) {
             String line = raw.strip();
-            if (line.isEmpty()) continue;
+            if (line.isEmpty() || line.startsWith("//")) continue;
+            if (line.regionMatches(true, 0, "podFilename:", 0, 12)) {
+                podFileName = line.substring(12).strip();
+                continue;
+            }
+            if (line.regionMatches(true, 0, "volumeName:", 0, 11)) {
+                volumeName = line.substring(11).strip();
+                continue;
+            }
 
             String fileName;
             String entryName;
@@ -61,7 +79,7 @@ public final class PodManifestParser {
             blobs.add(new PodArchiveWriter.Blob(entryName.toUpperCase(java.util.Locale.ROOT), data));
         }
 
-        return blobs;
+        return new Manifest(podFileName, volumeName, List.copyOf(blobs));
     }
 
     private static byte[] resolveFileBytes(String fileName, Path sourceFolder, Path parentFolder)

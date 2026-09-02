@@ -2,6 +2,9 @@
 # Edit at https://www.toptal.com/developers/gitignore?templates=visualstudiocode,macos,windows,java
 
 ### Java ###
+# Maven build output
+target/
+
 # Compiled class file
 *.class
 

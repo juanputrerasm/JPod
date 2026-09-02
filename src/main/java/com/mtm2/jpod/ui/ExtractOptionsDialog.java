@@ -22,7 +22,7 @@ public final class ExtractOptionsDialog extends JDialog {
     private final PodSession session;
 
     public ExtractOptionsDialog(Frame owner, PodSession session) {
-        super(owner, "JPod — Extract", true);
+        super(owner, "Extract", true);
         this.session = session;
 
         if (session.getTargetFolderPath() != null) {

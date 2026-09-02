@@ -9,6 +9,7 @@ import com.mtm2.jpod.io.PodReportExporter;
 import com.mtm2.jpod.io.pod.PodArchive;
 import com.mtm2.jpod.io.pod.PodArchiveReader;
 import com.mtm2.jpod.io.pod.PodArchiveWriter;
+import com.mtm2.jpod.io.pod.PodArchiveValidator;
 
 import javax.swing.*;
 import javax.swing.filechooser.FileNameExtensionFilter;
@@ -16,11 +17,14 @@ import javax.swing.table.DefaultTableCellRenderer;
 import javax.swing.table.DefaultTableModel;
 import java.awt.*;
 import java.awt.datatransfer.DataFlavor;
+import java.awt.datatransfer.StringSelection;
+import java.awt.datatransfer.Transferable;
 import java.awt.dnd.*;
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashSet;
@@ -54,6 +58,7 @@ public final class MainWindow extends JFrame {
     private final List<BrowserRow> displayedRows = new ArrayList<>();
     private final Set<String> collapsedFolderPaths = new HashSet<>();
     private final Set<String> knownFolderPaths = new HashSet<>();
+    private final Set<String> explicitFolderPaths = new HashSet<>();
 
     /** 80-char archive comment written into the POD header. */
     private String archiveComment = "";
@@ -63,6 +68,17 @@ public final class MainWindow extends JFrame {
 
     /** The last POD archive that was opened from disk; null for new/manifest archives. */
     private PodArchive openedArchive = null;
+    /**
+     * Set when the archive on disk already repeated an entry name. Those archives
+     * predate JPod and must stay savable, so the duplicate rule is relaxed for them
+     * while still applying to anything the user adds.
+     */
+    private boolean openedWithDuplicateNames = false;
+    private Path currentArchivePath = null;
+    private PodArchive.Format outputFormat = PodArchive.Format.POD1;
+    private final List<PodArchive.AuditEntry> auditEntries = new ArrayList<>();
+    private boolean auditEnabled = true;
+    private String auditAuthor = System.getProperty("user.name", "user");
 
     private final PodSession session = new PodSession();
     private final PodArchiveReader reader = new PodArchiveReader();
@@ -91,7 +107,21 @@ public final class MainWindow extends JFrame {
     // Inner record: one mutable entry
     // -------------------------------------------------------------------------
 
-    private record EditableEntry(String name, byte[] data) {}
+    /**
+     * One entry in the editor. {@code nameField} is the directory field the entry
+     * was read from, carried so a re-save reproduces it byte for byte; it is null
+     * for entries added from disk or from a manifest.
+     */
+    private record EditableEntry(String name, byte[] data, byte[] nameField,
+                                 String embeddedPaletteName, long timestamp) {
+        private EditableEntry(String name, byte[] data) {
+            this(name, data, null, null, Instant.now().getEpochSecond());
+        }
+        private EditableEntry(String name, byte[] data, byte[] nameField,
+                String embeddedPaletteName) {
+            this(name, data, nameField, embeddedPaletteName, Instant.now().getEpochSecond());
+        }
+    }
 
     // -------------------------------------------------------------------------
     // Constructor
@@ -133,6 +163,9 @@ public final class MainWindow extends JFrame {
                 if (e.getClickCount() == 2 && !e.isPopupTrigger()) handlePrimaryActivation(entryTable.rowAtPoint(e.getPoint()));
             }
         });
+        entryTable.setDragEnabled(true);
+        entryTable.setDropMode(DropMode.ON);
+        entryTable.setTransferHandler(new ArchiveEntryTransferHandler());
 
         activityIndicator.setOpaque(true);
         activityIndicator.setBackground(COLOR_IDLE);
@@ -201,12 +234,14 @@ public final class MainWindow extends JFrame {
         bar.setFloatable(false);
 
         bar.add(toolButton("Open…",           this::onOpen));
+        bar.add(toolButton("Save",            this::onSave));
         bar.add(toolButton("Save As…",        this::onSaveAs));
         bar.addSeparator();
         bar.add(toolButton("Expand +",        this::expandAllFolders));
         bar.add(toolButton("Collapse -",      this::collapseAllFolders));
         bar.addSeparator();
         bar.add(toolButton("Add Files…",      this::onAddFiles));
+        bar.add(toolButton("Add Folder…",     this::onAddFolder));
         bar.add(toolButton("Extract Sel.",    this::onExtractSelected));
         bar.add(toolButton("Extract All",     this::onExtractAll));
         bar.addSeparator();
@@ -228,7 +263,10 @@ public final class MainWindow extends JFrame {
         fileMenu.add(recentFilesMenu);
         fileMenu.addSeparator();
         fileMenu.add(menuItem("Add Files…",        this::onAddFiles));
+        fileMenu.add(menuItem("Add Folder…",       this::onAddFolder));
+        fileMenu.add(menuItem("Create Folder…",    this::onCreateFolder));
         fileMenu.add(menuItem("Remove Selected",   this::onRemoveSelected));
+        fileMenu.add(menuItem("Save",              this::onSave));
         fileMenu.add(menuItem("Save As…",          this::onSaveAs));
         fileMenu.addSeparator();
         fileMenu.add(menuItem("Extract All…",      this::onExtractAll));
@@ -242,6 +280,12 @@ public final class MainWindow extends JFrame {
         JMenu toolMenu = new JMenu("Tools");
         toolMenu.add(menuItem("Mount in pod.ini…", this::onMount));
         toolMenu.add(menuItem("Search…",           this::onSearch));
+        toolMenu.add(menuItem("Validate Archive…", this::onValidate));
+        JCheckBoxMenuItem auditItem = new JCheckBoxMenuItem("Record POD2 audit history", auditEnabled);
+        auditItem.addActionListener(e -> auditEnabled = auditItem.isSelected());
+        toolMenu.add(auditItem);
+        toolMenu.add(menuItem("Set Audit Author…", this::onSetAuditAuthor));
+        toolMenu.add(menuItem("View POD2 Audit History…", this::onViewAuditHistory));
 
         JMenu helpMenu = new JMenu("Help");
         helpMenu.add(menuItem("About JPod…", this::onAbout));
@@ -301,11 +345,15 @@ public final class MainWindow extends JFrame {
         if (browserRow != null && browserRow.folder()) {
             menu.add(menuItem(browserRow.collapsed() ? "Expand" : "Collapse", () -> toggleFolderRow(row)));
             menu.addSeparator();
+            menu.add(menuItem("Rename Folder…", () -> onRenameSelected(row)));
+            menu.add(menuItem("Move To Folder…", this::onMoveSelected));
             menu.add(menuItem("Remove", this::onRemoveSelected));
             menu.add(menuItem("Extract Selected", this::onExtractSelected));
         } else {
             menu.add(menuItem("Preview",            this::onPreview));
             menu.addSeparator();
+            menu.add(menuItem("Rename…",            () -> onRenameSelected(row)));
+            menu.add(menuItem("Move To Folder…",    this::onMoveSelected));
             menu.add(menuItem("Replace with File…", this::onReplaceEntry));
             menu.add(menuItem("Remove",             this::onRemoveSelected));
             menu.addSeparator();
@@ -338,6 +386,11 @@ public final class MainWindow extends JFrame {
         archiveComment = "";
         commentField.setText("");
         openedArchive = null;
+        openedWithDuplicateNames = false;
+        currentArchivePath = null;
+        outputFormat = PodArchive.Format.POD1;
+        auditEntries.clear();
+        explicitFolderPaths.clear();
         dirty = false;
         session.reset();
         refreshTable();
@@ -353,7 +406,7 @@ public final class MainWindow extends JFrame {
         if (!confirmDiscardChanges()) return;
         JFileChooser fc = new JFileChooser();
         fc.setDialogTitle("Open Response List File (.lst)");
-        fc.setFileFilter(new FileNameExtensionFilter("Response list files (*.lst)", "lst"));
+        fc.setFileFilter(new FileNameExtensionFilter("Response files (*.lst, *.rsp)", "lst", "rsp"));
         fc.setAcceptAllFileFilterUsed(true);
         applyRecentFolder(fc);
         if (fc.showOpenDialog(this) != JFileChooser.APPROVE_OPTION) return;
@@ -383,6 +436,143 @@ public final class MainWindow extends JFrame {
         addFilesToEntries(files);
     }
 
+    /** Recursively imports a directory, retaining its top-level folder name. */
+    private void onAddFolder() {
+        JFileChooser fc = new JFileChooser();
+        fc.setDialogTitle("Add Folder to Archive");
+        fc.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
+        applyRecentFolder(fc);
+        if (fc.showOpenDialog(this) != JFileChooser.APPROVE_OPTION) return;
+        Path directory = fc.getSelectedFile().toPath();
+        try {
+            List<File> files;
+            try (var paths = Files.walk(directory)) {
+                files = paths.filter(Files::isRegularFile).map(Path::toFile).toList();
+            }
+            addFilesToEntries(files, directory.getParent());
+        } catch (IOException ex) {
+            showError("Folder import failed", ex);
+        }
+    }
+
+    private void onCreateFolder() {
+        String parent = selectedFolderPath();
+        String name = JOptionPane.showInputDialog(this, "Folder name:", "Create Folder",
+                JOptionPane.PLAIN_MESSAGE);
+        if (name == null || name.isBlank()) return;
+        String path = parent.isBlank() ? name.strip() : parent + "\\" + name.strip();
+        try {
+            PodArchiveWriter.validatePath(path);
+            explicitFolderPaths.add(normalizeArchivePath(path));
+            markDirty();
+            refreshTable();
+        } catch (IOException ex) {
+            showError("Invalid folder", ex);
+        }
+    }
+
+    private void onRenameSelected(int viewRow) {
+        if (viewRow < 0 || viewRow >= displayedRows.size()) return;
+        BrowserRow row = displayedRows.get(viewRow);
+        String oldLabel = row.folder() ? row.displayName()
+                : baseName(editableEntries.get(row.sourceIndex()).name());
+        String replacement = JOptionPane.showInputDialog(this, "New name:", oldLabel);
+        if (replacement == null || replacement.isBlank() || replacement.equals(oldLabel)) return;
+        if (replacement.indexOf('/') >= 0 || replacement.indexOf('\\') >= 0) {
+            JOptionPane.showMessageDialog(this, "Enter one file or folder name, not a path.",
+                    TITLE, JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+        String oldPrefix = row.folder() ? row.folderPath().replace('/', '\\') : null;
+        List<EditableEntry> changed = new ArrayList<>(editableEntries);
+        for (int i = 0; i < changed.size(); i++) {
+            EditableEntry entry = changed.get(i);
+            String name = entry.name();
+            String newName;
+            if (row.folder()) {
+                if (!normalizeArchivePath(name).startsWith(row.folderPath() + "/")) continue;
+                int slash = oldPrefix.lastIndexOf('\\');
+                String parent = slash >= 0 ? oldPrefix.substring(0, slash + 1) : "";
+                String renamedPrefix = parent + replacement.strip();
+                newName = renamedPrefix + name.substring(oldPrefix.length());
+            } else {
+                if (i != row.sourceIndex()) continue;
+                int slash = Math.max(name.lastIndexOf('/'), name.lastIndexOf('\\'));
+                newName = (slash >= 0 ? name.substring(0, slash + 1) : "") + replacement.strip();
+            }
+            changed.set(i, renamedEntry(entry, newName));
+            addMoveAudit(name, newName, entry);
+        }
+        if (!validateEditedEntries(changed)) return;
+        editableEntries.clear();
+        editableEntries.addAll(changed);
+        if (row.folder()) {
+            explicitFolderPaths.remove(row.folderPath());
+        }
+        markDirty();
+        refreshTable();
+    }
+
+    private void onMoveSelected() {
+        int[] indices = selectedSourceRows();
+        if (indices.length == 0) return;
+        String sourceFolder = selectedFolderRoot();
+        List<String> folders = new ArrayList<>();
+        folders.add("(archive root)");
+        knownFolderPaths.stream().sorted(String.CASE_INSENSITIVE_ORDER).forEach(folders::add);
+        Object chosen = JOptionPane.showInputDialog(this, "Destination folder:", "Move Entries",
+                JOptionPane.PLAIN_MESSAGE, null, folders.toArray(), folders.get(0));
+        if (chosen == null) return;
+        String destination = chosen.equals(folders.get(0)) ? "" : chosen.toString().replace('/', '\\');
+        moveEntries(indices, destination, sourceFolder);
+    }
+
+    private void moveEntries(int[] indices, String destination) {
+        moveEntries(indices, destination, null);
+    }
+
+    private void moveEntries(int[] indices, String destination, String sourceFolder) {
+        String sourcePrefix = sourceFolder == null ? null : sourceFolder.replace('/', '\\');
+        if (sourcePrefix != null && (destination.equalsIgnoreCase(sourcePrefix)
+                || destination.regionMatches(true, 0, sourcePrefix + "\\", 0, sourcePrefix.length() + 1))) {
+            JOptionPane.showMessageDialog(this, "A folder cannot be moved into itself.", TITLE,
+                    JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+        List<EditableEntry> changed = new ArrayList<>(editableEntries);
+        List<String[]> moved = new ArrayList<>();
+        for (int index : indices) {
+            EditableEntry entry = changed.get(index);
+            String newName;
+            if (sourcePrefix != null && entry.name().regionMatches(true, 0,
+                    sourcePrefix + "\\", 0, sourcePrefix.length() + 1)) {
+                String targetPrefix = destination.isBlank() ? baseName(sourcePrefix)
+                        : destination + "\\" + baseName(sourcePrefix);
+                newName = targetPrefix + entry.name().substring(sourcePrefix.length());
+            } else {
+                newName = destination.isBlank() ? baseName(entry.name())
+                        : destination + "\\" + baseName(entry.name());
+            }
+            changed.set(index, renamedEntry(entry, newName));
+            moved.add(new String[] {entry.name(), newName, Integer.toString(index)});
+        }
+        if (!validateEditedEntries(changed)) return;
+        editableEntries.clear();
+        editableEntries.addAll(changed);
+        for (String[] move : moved) {
+            addMoveAudit(move[0], move[1], editableEntries.get(Integer.parseInt(move[2])));
+        }
+        markDirty();
+        refreshTable();
+    }
+
+    private String selectedFolderRoot() {
+        int[] rows = entryTable.getSelectedRows();
+        if (rows.length != 1 || rows[0] < 0 || rows[0] >= displayedRows.size()) return null;
+        BrowserRow row = displayedRows.get(rows[0]);
+        return row.folder() ? row.folderPath() : null;
+    }
+
     /** Removes every currently selected table row from the editable list. */
     private void onRemoveSelected() {
         int[] rows = entryTable.getSelectedRows();
@@ -394,6 +584,9 @@ public final class MainWindow extends JFrame {
         int[] sourceRows = selectedSourceRows();
         // Remove in reverse order so indices stay stable
         for (int i = sourceRows.length - 1; i >= 0; i--) {
+            EditableEntry removed = editableEntries.get(sourceRows[i]);
+            addAudit(PodArchive.AuditAction.REMOVE, removed.name(), removed.timestamp(),
+                    removed.data().length, 0, 0);
             editableEntries.remove(sourceRows[i]);
         }
         markDirty();
@@ -425,7 +618,13 @@ public final class MainWindow extends JFrame {
         try {
             byte[] newData = Files.readAllBytes(fc.getSelectedFile().toPath());
             EditableEntry old = editableEntries.get(row);
-            editableEntries.set(row, new EditableEntry(old.name(), newData));
+            // Replace swaps the payload and keeps the archive name, so the
+            // original directory field still describes this entry.
+            long now = Files.getLastModifiedTime(fc.getSelectedFile().toPath()).toInstant().getEpochSecond();
+            editableEntries.set(row, new EditableEntry(old.name(), newData, old.nameField(),
+                    old.embeddedPaletteName(), now));
+            addAudit(PodArchive.AuditAction.CHANGE, old.name(), old.timestamp(),
+                    old.data().length, now, newData.length);
             markDirty();
             refreshTable();
             selectTableRow(row);
@@ -445,35 +644,71 @@ public final class MainWindow extends JFrame {
                     JOptionPane.WARNING_MESSAGE);
             return;
         }
+        PodArchive.Format selectedFormat = chooseOutputFormat();
+        if (selectedFormat == null) return;
         Path target = chooseSaveFile("Save Archive As", "pod");
         if (target == null) return;
+        saveTo(target, selectedFormat);
+    }
 
-        // Use whatever is currently in the comment field
+    private void onSave() {
+        if (currentArchivePath == null) {
+            onSaveAs();
+            return;
+        }
+        saveTo(currentArchivePath, outputFormat);
+    }
+
+    private void saveTo(Path target, PodArchive.Format requestedFormat) {
         archiveComment = commentField.getText();
-
         String savedComment = archiveComment;
         List<EditableEntry> snapshot = List.copyOf(editableEntries);
+        List<PodArchiveWriter.Blob> blobs = toBlobs(snapshot);
+        PodArchiveValidator.Result validation = PodArchiveValidator.validateForSave(
+                savedComment, blobs, requestedFormat);
+        if (!validation.isValid()) {
+            showValidationResult(validation);
+            return;
+        }
+        if (openedArchive != null && openedArchive.getFormat() == PodArchive.Format.POD2
+                && validation.outputFormat() != PodArchive.Format.POD2) {
+            int answer = JOptionPane.showConfirmDialog(this,
+                    "Saving as " + validation.outputFormat().displayName()
+                    + " discards POD2 timestamps and audit history. Continue?",
+                    TITLE, JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
+            if (answer != JOptionPane.YES_OPTION) return;
+        }
+        int answer = JOptionPane.showConfirmDialog(this,
+                "Write " + validation.outputFormat().displayName() + " to:\n" + target + "?",
+                "Confirm Archive Format", JOptionPane.YES_NO_OPTION, JOptionPane.QUESTION_MESSAGE);
+        if (answer != JOptionPane.YES_OPTION) return;
+
+        PodArchive.Format actual = validation.outputFormat();
         setBusy(true);
         new SwingWorker<PodArchive.Format, Void>() {
             @Override protected PodArchive.Format doInBackground() throws Exception {
-                List<PodArchiveWriter.Blob> blobs = new ArrayList<>(snapshot.size());
-                for (EditableEntry e : snapshot) {
-                    blobs.add(new PodArchiveWriter.Blob(e.name(), e.data()));
-                }
-                return new PodArchiveWriter().write(target, savedComment, blobs);
+                byte[] rawComment = openedArchive != null && openedArchive.isPod1Family()
+                        ? openedArchive.getCommentField() : null;
+                List<PodArchive.AuditEntry> audits = actual == PodArchive.Format.POD2 && auditEnabled
+                        ? List.copyOf(auditEntries) : List.of();
+                return new PodArchiveWriter().write(target, savedComment, blobs,
+                        new PodArchiveWriter.WriteOptions(actual, rawComment, audits,
+                                openedWithDuplicateNames));
             }
             @Override protected void done() {
                 setBusy(false);
                 try {
                     PodArchive.Format written = get();
                     dirty = false;
+                    currentArchivePath = target;
+                    outputFormat = written;
                     updateDirtyLabel();
                     session.setTargetFolderPath(target.getParent());
                     session.setTargetFileName(target.getFileName().toString());
                     progressLabel.setText("Saved: " + target.getFileName()
                             + " (" + written.displayName() + ")");
                     setTitle(TITLE + " - " + target.getFileName());
-                    if (written == PodArchive.Format.POD1_64) {
+                    if (written == PodArchive.Format.POD1_64 && requestedFormat == PodArchive.Format.POD1) {
                         JOptionPane.showMessageDialog(MainWindow.this,
                                 "This archive contains entry names longer than 31 characters, "
                                 + "so it was written with the 64-byte POD1 directory.\n"
@@ -633,6 +868,67 @@ public final class MainWindow extends JFrame {
         new SearchDialog(this, synth, this::selectTableRow).setVisible(true);
     }
 
+    private void onValidate() {
+        PodArchiveValidator.Result result = openedArchive != null && !dirty
+                ? PodArchiveValidator.validateOpened(openedArchive)
+                : PodArchiveValidator.validateForSave(commentField.getText(),
+                        toBlobs(editableEntries), outputFormat);
+        showValidationResult(result);
+    }
+
+    /** True when the archive as read already collides two entry names. */
+    private static boolean hasDuplicateNames(PodArchive archive) {
+        java.util.Set<String> seen = new java.util.HashSet<>();
+        for (PodArchive.Entry entry : archive.getEntries()) {
+            if (!seen.add(PodArchiveWriter.normalizeName(entry.name())
+                    .toUpperCase(java.util.Locale.ROOT))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void onSetAuditAuthor() {
+        String value = JOptionPane.showInputDialog(this, "POD2 audit author:", auditAuthor);
+        if (value != null && !value.isBlank()) auditAuthor = value.strip();
+    }
+
+    private void onViewAuditHistory() {
+        String[] columns = {"Time", "User", "Action", "Entry", "Old size", "New size"};
+        Object[][] rows = new Object[auditEntries.size()][columns.length];
+        for (int i = 0; i < auditEntries.size(); i++) {
+            PodArchive.AuditEntry audit = auditEntries.get(i);
+            rows[i] = new Object[] {Instant.ofEpochSecond(audit.timestamp()), audit.user(),
+                    audit.action(), audit.entryPath(), audit.oldSize(), audit.newSize()};
+        }
+        JTable table = new JTable(rows, columns);
+        table.setAutoCreateRowSorter(true);
+        JScrollPane pane = new JScrollPane(table);
+        pane.setPreferredSize(new Dimension(760, 360));
+        JOptionPane.showMessageDialog(this, pane, "POD2 Audit History",
+                JOptionPane.INFORMATION_MESSAGE);
+    }
+
+    private PodArchive.Format chooseOutputFormat() {
+        PodArchive.Format[] formats = {PodArchive.Format.POD1,
+                PodArchive.Format.POD1_64, PodArchive.Format.POD2};
+        return (PodArchive.Format) JOptionPane.showInputDialog(this, "Archive format:",
+                "Save Archive As", JOptionPane.PLAIN_MESSAGE, null, formats, outputFormat);
+    }
+
+    private void showValidationResult(PodArchiveValidator.Result result) {
+        StringBuilder message = new StringBuilder("Output format: ")
+                .append(result.outputFormat().displayName()).append('\n');
+        if (result.errors().isEmpty() && result.warnings().isEmpty()) {
+            message.append("No problems found.");
+        } else {
+            for (String error : result.errors()) message.append("\nERROR: ").append(error);
+            for (String warning : result.warnings()) message.append("\nWarning: ").append(warning);
+        }
+        JOptionPane.showMessageDialog(this, message.toString(), "Archive Validation",
+                result.errors().isEmpty() ? JOptionPane.INFORMATION_MESSAGE : JOptionPane.ERROR_MESSAGE);
+    }
+
     private void onPreview() {
         int row = entryTable.getSelectedRow();
         if (row < 0) return;
@@ -642,10 +938,7 @@ public final class MainWindow extends JFrame {
         int sourceIndex = toSourceIndex(row);
         if (sourceIndex < 0 || sourceIndex >= editableEntries.size()) return;
         EditableEntry e = editableEntries.get(sourceIndex);
-        PreviewWindow window = new PreviewWindow(this, e.name(), e.data(), openedArchive);
-        if (!window.isPreviewCancelled()) {
-            window.setVisible(true);
-        }
+        PreviewWindow.open(this, e.name(), e.data(), openedArchive, e.nameField());
     }
 
     private void onAbout() {
@@ -688,12 +981,42 @@ public final class MainWindow extends JFrame {
 
     /** Reads each file and appends it to {@code editableEntries}. */
     private void addFilesToEntries(List<File> files) {
+        addFilesToEntries(files, null);
+    }
+
+    private void addFilesToEntries(List<File> files, Path relativeRoot) {
         int added = 0;
         for (File f : files) {
+            if (f.isDirectory()) {
+                try (var paths = Files.walk(f.toPath())) {
+                    List<File> nested = paths.filter(Files::isRegularFile).map(Path::toFile).toList();
+                    addFilesToEntries(nested, f.toPath().getParent());
+                } catch (IOException ex) {
+                    showError("Could not import folder " + f.getName(), ex);
+                }
+                continue;
+            }
             if (!f.isFile()) continue;
             try {
                 byte[] data = Files.readAllBytes(f.toPath());
-                editableEntries.add(new EditableEntry(f.getName(), data));
+                String name = relativeRoot == null ? f.getName()
+                        : relativeRoot.relativize(f.toPath()).toString();
+                name = PodArchiveWriter.normalizeName(name);
+                int existing = findEntryIndex(name);
+                long timestamp = Files.getLastModifiedTime(f.toPath()).toInstant().getEpochSecond();
+                EditableEntry addedEntry = new EditableEntry(name, data, null, null, timestamp);
+                if (existing >= 0) {
+                    int answer = JOptionPane.showConfirmDialog(this,
+                            "Entry already exists: " + name + "\nReplace it?", TITLE,
+                            JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
+                    if (answer != JOptionPane.YES_OPTION) continue;
+                    EditableEntry old = editableEntries.set(existing, addedEntry);
+                    addAudit(PodArchive.AuditAction.CHANGE, name, old.timestamp(),
+                            old.data().length, timestamp, data.length);
+                } else {
+                    editableEntries.add(addedEntry);
+                    addAudit(PodArchive.AuditAction.ADD, name, 0, 0, timestamp, data.length);
+                }
                 added++;
             } catch (IOException ex) {
                 JOptionPane.showMessageDialog(this,
@@ -830,6 +1153,58 @@ public final class MainWindow extends JFrame {
                 TITLE, JOptionPane.ERROR_MESSAGE);
     }
 
+    private List<PodArchiveWriter.Blob> toBlobs(List<EditableEntry> entries) {
+        List<PodArchiveWriter.Blob> blobs = new ArrayList<>(entries.size());
+        for (EditableEntry e : entries) {
+            blobs.add(new PodArchiveWriter.Blob(e.name(), e.data(), e.nameField(),
+                    e.embeddedPaletteName(), e.timestamp()));
+        }
+        return blobs;
+    }
+
+    private int findEntryIndex(String name) {
+        for (int i = 0; i < editableEntries.size(); i++) {
+            if (editableEntries.get(i).name().equalsIgnoreCase(name)) return i;
+        }
+        return -1;
+    }
+
+    private EditableEntry renamedEntry(EditableEntry entry, String newName) {
+        return new EditableEntry(PodArchiveWriter.normalizeName(newName), entry.data(),
+                entry.nameField(), entry.embeddedPaletteName(), entry.timestamp());
+    }
+
+    private boolean validateEditedEntries(List<EditableEntry> entries) {
+        PodArchiveValidator.Result validation = PodArchiveValidator.validateForSave(
+                commentField.getText(), toBlobs(entries), outputFormat);
+        if (!validation.isValid()) showValidationResult(validation);
+        return validation.isValid();
+    }
+
+    private String selectedFolderPath() {
+        int row = entryTable.getSelectedRow();
+        if (row < 0 || row >= displayedRows.size()) return "";
+        BrowserRow selected = displayedRows.get(row);
+        if (selected.folder()) return selected.folderPath().replace('/', '\\');
+        String name = editableEntries.get(selected.sourceIndex()).name();
+        int slash = Math.max(name.lastIndexOf('/'), name.lastIndexOf('\\'));
+        return slash >= 0 ? name.substring(0, slash) : "";
+    }
+
+    private void addMoveAudit(String oldName, String newName, EditableEntry entry) {
+        addAudit(PodArchive.AuditAction.REMOVE, oldName, entry.timestamp(),
+                entry.data().length, 0, 0);
+        addAudit(PodArchive.AuditAction.ADD, newName, 0, 0,
+                entry.timestamp(), entry.data().length);
+    }
+
+    private void addAudit(PodArchive.AuditAction action, String path,
+            long oldTimestamp, long oldSize, long newTimestamp, long newSize) {
+        if (!auditEnabled) return;
+        auditEntries.add(new PodArchive.AuditEntry(auditAuthor, Instant.now().getEpochSecond(),
+                action, path, oldTimestamp, oldSize, newTimestamp, newSize));
+    }
+
     /** Returns false if the user chose not to discard unsaved changes. */
     private boolean confirmDiscardChanges() {
         if (!dirty) return true;
@@ -888,6 +1263,15 @@ public final class MainWindow extends JFrame {
                 try {
                     PodArchive archive = get();
                     openedArchive = archive;
+                    openedWithDuplicateNames = hasDuplicateNames(archive);
+                    currentArchivePath = selected;
+                    outputFormat = archive.getFormat() == PodArchive.Format.POD1_64
+                            ? PodArchive.Format.POD1_64
+                            : archive.getFormat() == PodArchive.Format.POD2
+                                    ? PodArchive.Format.POD2 : PodArchive.Format.POD1;
+                    auditEntries.clear();
+                    auditEntries.addAll(archive.getAuditEntries());
+                    explicitFolderPaths.clear();
                     session.setOpenArchive(archive);
                     archiveComment = archive.getComment();
                     session.setArchiveComment(archiveComment);
@@ -895,8 +1279,8 @@ public final class MainWindow extends JFrame {
                     editableEntries.clear();
                     resetFolderBrowserState();
                     for (PodArchive.Entry entry : archive.getEntries()) {
-                        editableEntries.add(new EditableEntry(entry.name(),
-                                archive.getEntryBytes(entry)));
+                        editableEntries.add(new EditableEntry(entry.name(), archive.getEntryBytes(entry),
+                                entry.nameField(), entry.embeddedPaletteName(), entry.timestamp()));
                     }
                     dirty = false;
                     refreshTable();
@@ -913,23 +1297,30 @@ public final class MainWindow extends JFrame {
         Path sourceFolder = manifestPath.getParent();
 
         setBusy(true);
-        new SwingWorker<List<PodArchiveWriter.Blob>, Void>() {
-            @Override protected List<PodArchiveWriter.Blob> doInBackground() throws Exception {
-                return new PodManifestParser().parse(manifestPath, sourceFolder);
+        new SwingWorker<PodManifestParser.Manifest, Void>() {
+            @Override protected PodManifestParser.Manifest doInBackground() throws Exception {
+                return new PodManifestParser().parseManifest(manifestPath, sourceFolder);
             }
             @Override protected void done() {
                 setBusy(false);
                 try {
-                    List<PodArchiveWriter.Blob> blobs = get();
+                    PodManifestParser.Manifest manifest = get();
+                    List<PodArchiveWriter.Blob> blobs = manifest.blobs();
                     editableEntries.clear();
                     resetFolderBrowserState();
                     for (PodArchiveWriter.Blob b : blobs) {
-                        editableEntries.add(new EditableEntry(b.name(), b.data()));
+                        editableEntries.add(new EditableEntry(b.name(), b.data(), b.nameField(),
+                                b.embeddedPaletteName(), b.timestamp()));
                     }
-                    archiveComment = "";
-                    commentField.setText("");
+                    archiveComment = manifest.volumeName();
+                    commentField.setText(archiveComment);
                     openedArchive = null;
+                    currentArchivePath = null;
+                    outputFormat = PodArchive.Format.POD1;
+                    auditEntries.clear();
+                    explicitFolderPaths.clear();
                     session.setSourceFolderPath(sourceFolder);
+                    session.setTargetFileName(manifest.podFileName());
                     dirty = true;
                     refreshTable();
                     rememberOpenedFile(manifestPath);
@@ -1162,6 +1553,13 @@ public final class MainWindow extends JFrame {
 
     private FolderNode buildFolderTree() {
         FolderNode root = new FolderNode("", "", -1);
+        for (String folderPath : explicitFolderPaths) {
+            FolderNode cursor = root;
+            String[] parts = folderPath.split("[/\\\\]+");
+            for (String part : parts) {
+                if (!part.isBlank()) cursor = cursor.childFolder(part, Integer.MAX_VALUE);
+            }
+        }
         for (int i = 0; i < editableEntries.size(); i++) {
             EditableEntry entry = editableEntries.get(i);
             String[] parts = splitEntryName(entry.name());
@@ -1327,6 +1725,51 @@ public final class MainWindow extends JFrame {
         NONE,
         ASC,
         DESC
+    }
+
+    /** Internal table drag moves selected entries into the folder under the pointer. */
+    private final class ArchiveEntryTransferHandler extends TransferHandler {
+        @Override protected Transferable createTransferable(JComponent component) {
+            int[] indices = selectedSourceRows();
+            String root = selectedFolderRoot();
+            String encodedIndices = java.util.Arrays.stream(indices)
+                    .mapToObj(String::valueOf).collect(java.util.stream.Collectors.joining(","));
+            return new StringSelection((root == null ? "" : root) + "\n" + encodedIndices);
+        }
+
+        @Override public int getSourceActions(JComponent component) { return MOVE; }
+
+        @Override public boolean canImport(TransferSupport support) {
+            return support.isDrop() && support.isDataFlavorSupported(DataFlavor.stringFlavor);
+        }
+
+        @Override public boolean importData(TransferSupport support) {
+            if (!canImport(support)) return false;
+            try {
+                String text = (String) support.getTransferable().getTransferData(DataFlavor.stringFlavor);
+                String[] payload = text.split("\\n", 2);
+                String sourceFolder = payload[0].isBlank() ? null : payload[0];
+                String encodedIndices = payload.length > 1 ? payload[1] : payload[0];
+                int[] indices = java.util.Arrays.stream(encodedIndices.split(","))
+                        .filter(value -> !value.isBlank()).mapToInt(Integer::parseInt).toArray();
+                JTable.DropLocation location = (JTable.DropLocation) support.getDropLocation();
+                int rowIndex = location.getRow();
+                String destination = "";
+                if (rowIndex >= 0 && rowIndex < displayedRows.size()) {
+                    BrowserRow row = displayedRows.get(rowIndex);
+                    if (row.folder()) destination = row.folderPath().replace('/', '\\');
+                    else {
+                        String name = editableEntries.get(row.sourceIndex()).name();
+                        int slash = Math.max(name.lastIndexOf('/'), name.lastIndexOf('\\'));
+                        destination = slash >= 0 ? name.substring(0, slash) : "";
+                    }
+                }
+                moveEntries(indices, destination, sourceFolder);
+                return true;
+            } catch (Exception ex) {
+                return false;
+            }
+        }
     }
 
     private final class BrowserNameCellRenderer extends DefaultTableCellRenderer {

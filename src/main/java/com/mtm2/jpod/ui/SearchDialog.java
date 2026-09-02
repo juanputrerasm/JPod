@@ -5,6 +5,7 @@ import com.mtm2.jpod.io.pod.PodArchive;
 import javax.swing.*;
 import javax.swing.table.DefaultTableModel;
 import java.awt.*;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.function.IntConsumer;
@@ -28,10 +29,17 @@ public final class SearchDialog extends JDialog {
     private final DefaultTableModel resultModel;
     private final JTable resultTable;
     private final JLabel statusLabel = new JLabel(" ");
-    private int searchFrom = 0;
+    private final List<Integer> matchIndices = new ArrayList<>();
+
+    /**
+     * The query and options the current result list was built from. Find Next
+     * re-runs the search when this no longer matches the dialog, and otherwise
+     * steps through the results it already has.
+     */
+    private String resultsKey;
 
     public SearchDialog(Frame owner, List<PodArchive.Entry> entries, IntConsumer selectCallback) {
-        super(owner, "JPod — Search", false);
+        super(owner, "Search", true);
         this.entries = entries;
         this.selectCallback = selectCallback;
 
@@ -53,15 +61,12 @@ public final class SearchDialog extends JDialog {
         JButton jumpBtn = new JButton("Jump To");
         JButton closeBtn = new JButton("Close");
 
-        findNextBtn.addActionListener(e -> findNext(true));
-        findPrevBtn.addActionListener(e -> findNext(false));
+        findNextBtn.addActionListener(e -> step(true));
+        findPrevBtn.addActionListener(e -> step(false));
         jumpBtn.addActionListener(e -> jumpToSelected());
         closeBtn.addActionListener(e -> dispose());
 
-        searchBox.addActionListener(e -> {
-            searchFrom = 0;
-            findNext(true);
-        });
+        searchBox.addActionListener(e -> step(true));
 
         JPanel topPanel = new JPanel(new BorderLayout(4, 4));
         topPanel.setBorder(BorderFactory.createEmptyBorder(6, 6, 4, 6));
@@ -95,11 +100,57 @@ public final class SearchDialog extends JDialog {
         setLocationRelativeTo(owner);
     }
 
-    private void findNext(boolean forward) {
-        resultModel.setRowCount(0);
-        String query = searchBox.getText();
-        if (query.isBlank()) { statusLabel.setText("Enter a search term."); return; }
+    /** Identifies the search the current results belong to. */
+    private String currentKey() {
+        return searchBox.getText() + " " + matchCaseCheck.isSelected()
+                + " " + searchNamesCheck.isSelected()
+                + " " + searchSizesCheck.isSelected();
+    }
 
+    /**
+     * Runs the search if the query or options changed, then moves one match in the
+     * requested direction, wrapping at either end, and jumps the main window's
+     * table to it.
+     */
+    private void step(boolean forward) {
+        if (searchBox.getText().isBlank()) {
+            resultModel.setRowCount(0);
+            matchIndices.clear();
+            resultsKey = null;
+            statusLabel.setText("Enter a search term.");
+            return;
+        }
+
+        boolean rebuilt = false;
+        if (!currentKey().equals(resultsKey)) {
+            find();
+            rebuilt = true;
+        }
+        if (matchIndices.isEmpty()) return;
+
+        int current = resultTable.getSelectedRow();
+        int next;
+        if (rebuilt || current < 0) {
+            // A fresh search starts at the first match going forward, and at the
+            // last one going backward.
+            next = forward ? 0 : matchIndices.size() - 1;
+        } else {
+            next = forward
+                    ? (current + 1) % matchIndices.size()
+                    : (current - 1 + matchIndices.size()) % matchIndices.size();
+        }
+
+        resultTable.setRowSelectionInterval(next, next);
+        resultTable.scrollRectToVisible(resultTable.getCellRect(next, 0, true));
+        statusLabel.setText("Match " + (next + 1) + " of " + matchIndices.size() + ".");
+        selectCallback.accept(matchIndices.get(next));
+    }
+
+    private void find() {
+        resultModel.setRowCount(0);
+        matchIndices.clear();
+
+        String query = searchBox.getText();
         String q = matchCaseCheck.isSelected() ? query : query.toLowerCase(Locale.ROOT);
 
         for (int i = 0; i < entries.size(); i++) {
@@ -108,9 +159,11 @@ public final class SearchDialog extends JDialog {
             boolean sizeMatch = searchSizesCheck.isSelected() && matches(String.valueOf(e.length()), q);
             if (nameMatch || sizeMatch) {
                 resultModel.addRow(new Object[]{e.name(), e.length()});
+                matchIndices.add(i);
             }
         }
 
+        resultsKey = currentKey();
         statusLabel.setText(resultModel.getRowCount() == 0
                 ? "No matches." : resultModel.getRowCount() + " match(es).");
     }
@@ -122,13 +175,7 @@ public final class SearchDialog extends JDialog {
 
     private void jumpToSelected() {
         int row = resultTable.getSelectedRow();
-        if (row < 0) return;
-        String name = (String) resultModel.getValueAt(row, 0);
-        for (int i = 0; i < entries.size(); i++) {
-            if (entries.get(i).name().equals(name)) {
-                selectCallback.accept(i);
-                break;
-            }
-        }
+        if (row < 0 || row >= matchIndices.size()) return;
+        selectCallback.accept(matchIndices.get(row));
     }
 }

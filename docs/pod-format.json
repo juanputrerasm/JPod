@@ -1,0 +1,282 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "specification": "Terminal Reality POD archive family",
+  "version": "1.0.0",
+  "updated": "2026-09-01",
+  "prose": "POD_FORMAT.md",
+  "confidenceLevels": {
+    "verified": "Confirmed against shipped archives; see evidence.",
+    "documented": "Stated by an upstream document; see references.",
+    "implemented": "Implemented by readers in this family and self-consistent, but no shipped archive was available to confirm it.",
+    "unresolved": "Not known. Recorded so it is not silently guessed at."
+  },
+  "conventions": {
+    "byteOrder": "little",
+    "encoding": "ISO-8859-1",
+    "codePage": 28591,
+    "stringTermination": "NUL inside a fixed-width field",
+    "stringTrim": "remove leading and trailing code points <= U+0020, control characters included",
+    "offsetBase": "absolute from start of file",
+    "postTerminatorBytes": "not guaranteed zero; see formats[*].nameField",
+    "confidence": "verified"
+  },
+  "detection": {
+    "minimumFileSize": 84,
+    "order": [
+      { "format": "EPD", "signature": { "offset": 0, "bytes": "64747865", "ascii": "dtxe" } },
+      { "format": "POD2", "signature": { "offset": 0, "bytes": "504F4432", "ascii": "POD2" } },
+      { "format": "POD1_FAMILY", "signature": null, "resolveBy": "directoryValidation" }
+    ],
+    "directoryValidation": {
+      "note": "POD1 carries no version marker in any available archive. Try each candidate layout in order and accept the first whose whole directory validates.",
+      "candidates": ["POD1", "POD1_64"],
+      "acceptAll": true,
+      "confidence": "implemented"
+    }
+  },
+  "formats": {
+    "POD1": {
+      "displayName": "POD1",
+      "titles": ["Monster Truck Madness 1", "Monster Truck Madness 2", "Terminal Velocity", "Fury3", "Hellbender", "CART Precision Racing"],
+      "confidence": "verified",
+      "header": {
+        "size": 84,
+        "fields": [
+          { "name": "entryCount", "offset": 0, "size": 4, "type": "int32" },
+          { "name": "comment", "offset": 4, "size": 80, "type": "char[]", "mayCarryTrailingBytes": true }
+        ]
+      },
+      "directory": { "origin": 84, "recordSize": 40, "order": "entry order" },
+      "record": {
+        "fields": [
+          { "name": "nameField", "offset": 0, "size": 32, "type": "char[]", "see": "nameField" },
+          { "name": "length", "offset": 32, "size": 4, "type": "uint32" },
+          { "name": "offset", "offset": 36, "size": 4, "type": "uint32" }
+        ]
+      },
+      "nameField": {
+        "width": 32,
+        "maxPathBytes": 31,
+        "pathSeparator": "\\",
+        "structure": "path NUL [paletteRecord NUL] zeros",
+        "note": "The path is the first NUL-terminated string. Entry lookup must use only that string."
+      },
+      "payloads": { "origin": "84 + entryCount * 40", "layout": "contiguous, in directory order, no alignment or padding" }
+    },
+    "POD1_64": {
+      "displayName": "Extended POD1",
+      "aka": ["POD1-64"],
+      "titles": ["Community Patch 3 content"],
+      "confidence": "implemented",
+      "header": {
+        "size": 84,
+        "confidence": "implemented",
+        "fields": [
+          { "name": "entryCount", "offset": 0, "size": 4, "type": "int32" },
+          { "name": "comment", "offset": 4, "size": 80, "type": "char[]", "mayCarryTrailingBytes": true }
+        ]
+      },
+      "directory": { "origin": 84, "recordSize": 72, "order": "entry order" },
+      "record": {
+        "fields": [
+          { "name": "nameField", "offset": 0, "size": 64, "type": "char[]", "see": "nameField" },
+          { "name": "length", "offset": 64, "size": 4, "type": "uint32" },
+          { "name": "offset", "offset": 68, "size": 4, "type": "uint32" }
+        ]
+      },
+      "nameField": {
+        "width": 64,
+        "maxPathBytes": 63,
+        "pathSeparator": "\\",
+        "structure": "path NUL zeros",
+        "paletteRecordPermitted": "unresolved"
+      },
+      "payloads": { "origin": "84 + entryCount * 72", "layout": "contiguous, in directory order" },
+      "openQuestions": [
+        {
+          "id": "versionTag",
+          "confidence": "unresolved",
+          "summary": "Upstream notes describe production extended archives as carrying a version-tagged header. No available document gives the tag bytes, its offset, or the resulting directory origin.",
+          "consequence": "The layout above is the untagged interpretation. A tagged archive whose directory does not begin at byte 84 will not be read.",
+          "action": "Retain any known-good extended archive as a fixture and revise detection from observed bytes."
+        }
+      ]
+    },
+    "POD2": {
+      "displayName": "POD2",
+      "titles": ["Nocturne", "4x4 Evo", "4x4 Evo 2"],
+      "confidence": "implemented",
+      "header": {
+        "size": 96,
+        "fields": [
+          { "name": "signature", "offset": 0, "size": 4, "type": "char[]", "value": "POD2" },
+          { "name": "checksum", "offset": 4, "size": 4, "type": "uint32", "algorithm": "CRC-32/MPEG-2 over bytes 8 through EOF", "read": true, "write": true },
+          { "name": "comment", "offset": 8, "size": 80, "type": "char[]" },
+          { "name": "entryCount", "offset": 88, "size": 4, "type": "uint32" },
+          { "name": "auditCount", "offset": 92, "size": 4, "type": "uint32", "read": true, "write": true }
+        ]
+      },
+      "directory": { "origin": 96, "recordSize": 20, "order": "entry order" },
+      "record": {
+        "fields": [
+          { "name": "nameOffset", "offset": 0, "size": 4, "type": "uint32", "relativeTo": "nameTable" },
+          { "name": "length", "offset": 4, "size": 4, "type": "uint32" },
+          { "name": "offset", "offset": 8, "size": 4, "type": "uint32" },
+          { "name": "timestamp", "offset": 12, "size": 4, "type": "uint32", "encoding": "unix epoch seconds", "read": true, "write": true },
+          { "name": "checksum", "offset": 16, "size": 4, "type": "uint32", "algorithm": "CRC-32/MPEG-2 over payload", "read": true, "write": true }
+        ]
+      },
+      "nameTable": {
+        "origin": "96 + entryCount * 20",
+        "layout": "concatenated NUL-terminated strings",
+        "maxPathBytes": null
+      },
+      "audit": {
+        "origin": "after the final payload",
+        "recordSize": 312,
+        "fields": [
+          { "name": "user", "offset": 0, "size": 32, "type": "char[]" },
+          { "name": "timestamp", "offset": 32, "size": 4, "type": "uint32", "encoding": "unix epoch seconds" },
+          { "name": "action", "offset": 36, "size": 4, "type": "uint32", "values": { "0": "add", "1": "remove", "2": "change" } },
+          { "name": "entryPath", "offset": 40, "size": 256, "type": "char[]" },
+          { "name": "oldTimestamp", "offset": 296, "size": 4, "type": "uint32" },
+          { "name": "oldSize", "offset": 300, "size": 4, "type": "uint32" },
+          { "name": "newTimestamp", "offset": 304, "size": 4, "type": "uint32" },
+          { "name": "newSize", "offset": 308, "size": 4, "type": "uint32" }
+        ]
+      }
+    },
+    "EPD": {
+      "displayName": "EPD",
+      "titles": ["Fly!"],
+      "confidence": "verified",
+      "evidenceNote": "One archive, SC24.EPD, 54 entries.",
+      "header": {
+        "size": 272,
+        "fields": [
+          { "name": "signature", "offset": 0, "size": 4, "type": "char[]", "value": "dtxe" },
+          { "name": "title", "offset": 4, "size": 4, "type": "char[]" },
+          { "name": "unidentified1", "offset": 8, "size": 136, "type": "bytes", "read": false },
+          { "name": "entryCount", "offset": 144, "size": 4, "type": "uint32" },
+          { "name": "unidentified2", "offset": 148, "size": 124, "type": "bytes", "read": false }
+        ]
+      },
+      "directory": { "origin": 272, "recordSize": 80, "order": "entry order" },
+      "record": {
+        "fields": [
+          { "name": "pathPrefix", "offset": 0, "size": 4, "type": "char[]" },
+          { "name": "pathRemainder", "offset": 4, "size": 60, "type": "char[]" },
+          { "name": "length", "offset": 64, "size": 4, "type": "uint32" },
+          { "name": "offset", "offset": 68, "size": 4, "type": "uint32" },
+          { "name": "timestamp", "offset": 72, "size": 4, "type": "uint32", "encoding": "unix epoch seconds", "read": false },
+          { "name": "unidentified3", "offset": 76, "size": 4, "type": "uint32", "read": false, "note": "distinct per entry, probably a checksum" }
+        ]
+      },
+      "pathReconstruction": {
+        "rule": "if pathRemainder starts with a backslash and pathPrefix matches ^[A-Z0-9_]+$ then pathPrefix + pathRemainder; else if pathRemainder is non-empty then pathRemainder; else the whole 64-byte field as one string",
+        "note": "The upper-case test distinguishes a directory prefix from payload that happens to sit in those four bytes."
+      },
+      "nameField": {
+        "width": 64,
+        "structure": "path NUL uninitialised",
+        "postTerminatorContent": "heap junk; SC24.EPD pads every record with the repeating pattern BA AD F0 0D",
+        "readable": false
+      }
+    }
+  },
+  "paletteRecord": {
+    "confidence": "verified",
+    "appliesTo": ["POD1"],
+    "summary": "The early Terminal Reality packer wrote a second NUL-terminated string after the path on every .RAW entry: the file name of the .ACT palette the art was authored against.",
+    "location": "immediately after the path terminator, at len(path) + 1",
+    "acceptanceRules": [
+      "the entry path ends in .RAW, case-insensitive",
+      "the second string ends in .ACT, case-insensitive",
+      "the second string is a bare file name with no directory part"
+    ],
+    "rejectionNote": "Both rules are required. The community archive POWER.POD carries 30 second strings, 21 on non-RAW entries and none ending in .ACT, which are uninitialised buffer contents.",
+    "resolution": {
+      "matchAgainst": "the file name of each entry, not its full path",
+      "example": "BIONSHIP.ACT resolves to ART\\BIONSHIP.ACT",
+      "mayBeAbsent": true,
+      "absentExample": "MTM1 TRUCK.POD names METALCR2.ACT, which ships in GAME.POD",
+      "onAbsent": "fall back to name-based palette resolution"
+    },
+    "priority": "authoritative; takes precedence over every name-based rule",
+    "writtenBy": ["Monster Truck Madness 1", "Terminal Velocity", "Fury3", "Hellbender"],
+    "notWrittenBy": ["Monster Truck Madness 2", "CART Precision Racing"],
+    "engineConsumption": "unresolved",
+    "documentedUpstream": false
+  },
+  "validation": {
+    "rejectWhen": [
+      { "check": "fileSize < 84", "reason": "cannot hold a header" },
+      { "check": "entryCount < 1 or entryCount > 8192", "reason": "guards against non-POD input; Hellbender GAME.POD has 4341 entries so a lower cap is wrong" },
+      { "check": "directoryOrigin + entryCount * recordSize > fileSize", "reason": "truncated or misidentified" },
+      { "check": "path is empty", "reason": "a valid directory has no unnamed entries" },
+      { "check": "path contains a code point < 0x20 or a colon", "reason": "characteristic of a misparsed directory" },
+      { "check": "length(path) > 63", "reason": "cannot be terminated inside the widest field" },
+      { "check": "offset > fileSize or length > fileSize - offset", "reason": "payload outside the file; written this way to avoid 32-bit overflow" }
+    ],
+    "confidence": "verified"
+  },
+  "writerRules": [
+    { "id": "narrowestLayout", "rule": "Emit POD1 when every complete path fits in 31 bytes; emit POD1_64 only when a path needs the wider field.", "reason": "extended archives are unreadable by original engines and tools" },
+    { "id": "countWholePath", "rule": "Count any directory prefix, the stem, the extension and the terminator against the budget." },
+    { "id": "rejectDoNotTruncate", "rule": "A path that does not fit the widest available field is an error.", "reason": "a shortened name produces an archive that mounts and then cannot find its own content" },
+    { "id": "terminate", "rule": "NUL-terminate every name." },
+    { "id": "preserveFields", "rule": "Write an entry's original name field, and the header comment field, back verbatim when they fit the layout being emitted and their string is unedited.", "reason": "rebuilding a field from its string alone discards palette records and any other post-terminator content" },
+    { "id": "zeroFillUnknown", "rule": "For an entry with no original field, write the path, a terminator, and zeros." },
+    { "id": "recomputeOffsets", "rule": "Payload offsets follow the directory in entry order; do not carry the source archive's offsets across a rebuild." },
+    { "id": "doNotInventPaletteRecords", "rule": "Do not synthesise palette records.", "reason": "MTM2-era tools never wrote them and no engine is known to read them" },
+    { "id": "entryCapMatchesReader", "rule": "A writer's entry cap must be at least its reader's.", "reason": "a tool that opens an archive it cannot save back is a defect" }
+  ],
+  "roundTripProperty": {
+    "statement": "Given an archive's entries in original order with their original comment and name fields, a conforming writer reproduces the file byte for byte.",
+    "verifiedOn": 66,
+    "unitsVerified": "unique POD1 archives",
+    "assumption": "payloads are stored contiguously in directory order, which every surveyed archive satisfies",
+    "confidence": "verified"
+  },
+  "evidence": {
+    "surveyedOn": "2026-09-01",
+    "uniqueFiles": 67,
+    "totalEntries": 41212,
+    "byTitle": [
+      { "title": "Monster Truck Madness 1", "files": 5, "entries": 3543, "archivesWithPaletteRecords": 3, "paletteRecords": 2450 },
+      { "title": "Terminal Velocity", "files": 2, "entries": 2689, "archivesWithPaletteRecords": 1, "paletteRecords": 877 },
+      { "title": "Fury3", "files": 4, "entries": 4934, "archivesWithPaletteRecords": 3, "paletteRecords": 2752 },
+      { "title": "Hellbender", "files": 2, "entries": 5547, "archivesWithPaletteRecords": 2, "paletteRecords": 3888 },
+      { "title": "Monster Truck Madness 2", "files": 19, "entries": 9534, "archivesWithPaletteRecords": 0, "paletteRecords": 0 },
+      { "title": "CART Precision Racing", "files": 22, "entries": 7677, "archivesWithPaletteRecords": 0, "paletteRecords": 0 },
+      { "title": "Community", "files": 13, "entries": 7288, "archivesWithPaletteRecords": 0, "paletteRecords": 0 }
+    ],
+    "paletteRecordsTotal": 9967,
+    "secondStringsTotal": 9971,
+    "secondStringsResolvingToAnActInTheSameArchive": 9832,
+    "heuristicComparison": {
+      "heuristic": "any .ACT in the same archive directory",
+      "archives": ["MTM1 GAME.POD", "Fury3 FURY3.POD", "Terminal Velocity CDROM.POD", "Hellbender GAME.POD"],
+      "rawEntriesCompared": 8224,
+      "disagreements": 8221
+    },
+    "notCovered": [
+      "No POD1-64 archive was available; every POD1_64 claim is unverified.",
+      "No POD2 archive was available; all POD2 claims are unverified.",
+      "One EPD archive was available, so EPD rests on a single sample."
+    ]
+  },
+  "references": [
+    { "id": "ENGINE_LIMITS", "url": "https://www.mtm2.com/~mtmg/misc/ENGINE_LIMITS.md", "provides": "POD1 name budgets and the extended-directory design note" },
+    { "id": "CPOD_LONG_NAMES", "url": "https://www.mtm2.com/~mtmg/misc/CPOD_LONG_NAMES.md", "published": "2026-08-11", "provides": "naming policy only; no binary layout" },
+    { "id": "FILENAME_CONVENTIONS", "url": "https://www.mtm2.com/~mtmg/misc/FILENAME_CONVENTIONS.md", "status": "404 as of 2026-09-01" },
+    { "id": "EPD_REFERENCE", "url": "https://github.com/jopadan/termpod/wiki/EPD-Format-Reference" },
+    { "id": "POD2_REFERENCE", "url": "https://github.com/jopadan/termpod/wiki/Pod-2-Format-Reference" }
+  ],
+  "implementations": [
+    { "name": "JPod", "language": "Java" },
+    { "name": "KPod", "language": "C#" },
+    { "name": "JSPod", "language": "JavaScript" },
+    { "name": "JSTruckViewer", "language": "JavaScript" }
+  ]
+}

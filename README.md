@@ -2,7 +2,7 @@
 
 A Java 17 desktop tool for viewing, extracting, and building Terminal Reality **POD** (version 1) archives, the proprietary container format used by games including *Monster Truck Madness 1 & 2*, *CART Precision Racing*, *Hellbender*, *Terminal Velocity*, and *Fury3*. 
 JPod reads and writes both the classic POD1 directory and the Community Patch 3 **POD1-64** extension with 64-byte entry names.
-JPod also includes read-only support for `POD2` (*Nocturne*, *4x4 Evo 1 & 2*) and `EPD` (*Fly!*) archives for browsing, previewing, and extraction.
+JPod also reads and explicitly authors `POD2` (*Nocturne*, *4x4 Evo 1 & 2*), while `EPD` (*Fly!*) remains read-only.
 
 ---
 
@@ -22,16 +22,18 @@ JPod also includes read-only support for `POD2` (*Nocturne*, *4x4 Evo 1 & 2*) an
 
 ### Archive building & editing
 - **New Archive** - start an empty archive from scratch.
-- **Open Response List File** - load a `.lst` text file (one filename per line) and resolve each file from disk to build the entry list. Supports an optional `filename,archiveName` syntax per line.
-- **Add Files** - append individual files via a file picker or by drag-and-dropping files directly onto the entry table.
+- **Open Response List File** - load the existing `.lst` syntax or a PODTool-compatible `.rsp` with `podFilename:`, `volumeName:`, `//` comments, and relative source paths.
+- **Add Files / Add Folder** - append files or recursively import a directory via a picker or drag and drop.
+- **Folder editing** - create virtual folders, rename files or folder trees, and move selections by command or internal drag and drop. Archive paths use backslashes and retain case and entry order.
 - **Remove** - delete selected entries from the in-memory list.
 - **Replace** (right-click) - swap a single entry's data with a file from disk, keeping the original archive name.
-- **Save As** - write the current entry list to a new `.pod` file.
+- **Validate Archive** - check limits, unsafe or duplicate paths, field capacity, payload ranges, embedded RAW palette records, checksums, and the expected output layout.
+- **Save / Save As** - save a named archive or write a copy. The actual output format is confirmed first; POD1 is the default and POD2 must be selected explicitly.
 
 ### Format support
 - `POD1` - full browse, preview, extract, and save support.
 - `POD1-64` (Extended POD1) - full browse, preview, extract, and save support.
-- `POD2` - browse, preview, and extract support.
+- `POD2` - browse, preview, extract, explicit save/conversion, CRC, timestamp, and audit-history support.
 - `EPD` - browse, preview, and extract support.
 
 #### POD1-64 (Extended POD1)
@@ -47,7 +49,7 @@ POD1-64 is the Community Patch 3 long-name extension. It is not a 64-bit archive
 
 POD1 has no magic value, so JPod detects the layout by validating it. The classic 40-byte directory is tried first and accepted only when every record decodes to a plausible non-empty path whose byte range lies inside the file; the 72-byte layout is tried only if the classic table fails. That ordering keeps ordinary archives from being reported as extended. The title bar shows `Extended POD1` when the wider directory was used.
 
-When saving, JPod emits classic POD1 whenever every entry name fits in 31 bytes, and switches to POD1-64 only when a name needs the wider field, since extended archives can only be opened by updated engines and tools. The whole stored path counts, including prefixes such as `ART\` or `MODELS\`, the extension, and the null terminator. Names longer than 63 bytes are rejected rather than truncated. A save that produced an extended archive says so in the status line and in a confirmation dialog.
+For a new archive, JPod emits classic POD1 whenever every complete directory field fits and promotes to POD1-64 only when a path or embedded RAW palette record needs the wider field. An opened POD1-64 archive stays extended. The whole stored record counts, including the path, terminators, and palette name. Data that cannot fit 64 bytes is rejected rather than truncated. A save identifies its actual format before writing.
 
 ### Reports
 - **Save .inf** - exports a fixed-column text report (filename, total size, entry count, comment, and a padded name / size / offset table).
@@ -67,12 +69,22 @@ Double-click any entry (or press Preview from the right-click menu) to open a ty
 
 #### Palette resolution
 For `.raw` and `.clr` files, the palette is resolved in this order:
-1. Same base name in the same archive directory (e.g. `ART\DEMO1.RAW` → `ART\DEMO1.ACT`)
-2. `VGA.ACT` anywhere in the archive
-3. `METALCR2.ACT` anywhere in the archive (MTM1 default palette)
-4. Any other `.act` file in the archive
-5. `metalcr2.act` bundled as a classpath resource (`src/main/resources/palettes/`)
-6. Greyscale fallback
+1. The palette recorded in the entry's own POD directory field (see below)
+2. Same base name in the same archive directory (e.g. `ART\DEMO1.RAW` -> `ART\DEMO1.ACT`)
+3. Any other `.act` file in the same directory
+4. `VGA.ACT` anywhere in the archive
+5. `METALCR2.ACT` anywhere in the archive (MTM1 default palette)
+6. `metalcr2.act` bundled as a classpath resource
+7. Greyscale fallback
+
+Step 1 is the one that matters for MTM1, Terminal Velocity, Fury3 and Hellbender.
+Their packer stored the palette each RAW was authored against in the spare bytes
+of the entry's name field, and it is not derivable from the file name: on those
+games' main archives the old step-2-onward guess picks the wrong palette for 8 221
+of 8 224 RAW entries, because it takes whichever `.act` happens to come first in
+the archive. MTM2, CPR and community archives carry no such record and fall
+straight through to the name-based rules. [`docs/POD_FORMAT.md`](docs/POD_FORMAT.md)
+specifies it in full.
 
 When a RAW file does not match the common built-in sizes, JPod offers a preview dialog where you can:
 - choose width and height manually
@@ -91,9 +103,8 @@ Adds the open archive to the game's `pod.ini` mount list. JPod uses `99` as the 
 
 ## What JPod does not do
 
-- No save feature for POD v2 and EPD format.
+- No save feature for EPD format.
 - No MOD music playback - Terminal Reality's `.mod` files (6-channel ProTracker) require a tracker player. Extract the file and play it in an external player (e.g. VLC, OpenMPT).
-- No In-place archive editing - changes are always written to a *new* file via Save As; the original POD is never modified.
 - No POD v3, 4, 5, 6 support.
 
 ---
@@ -178,6 +189,16 @@ src/test/java/com/mtm2/jpod/io/pod/
 ```
 
 ---
+
+## Format specification
+
+[`docs/POD_FORMAT.md`](docs/POD_FORMAT.md) specifies the whole POD family: classic
+POD1, the POD1-64 long-name extension, POD2 and EPD. It covers the palette record
+the early Terminal Reality packer stored in the spare bytes of each RAW entry's
+name field, which is documented nowhere else, and it marks every claim as verified
+against shipped archives, documented upstream, implemented but unconfirmed, or
+unresolved. [`docs/pod-format.json`](docs/pod-format.json) carries the same
+structures as machine-readable data.
 
 ## References
 

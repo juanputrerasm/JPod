@@ -57,18 +57,44 @@ public final class PodArchive {
         public String displayName() {
             return displayName;
         }
+
+        @Override public String toString() { return displayName; }
     }
 
     private final Format format;
     private final String comment;
     private final byte[] bytes;
     private final List<Entry> entries;
+    private final byte[] commentField;
+    private final long checksum;
+    private final List<AuditEntry> auditEntries;
 
     PodArchive(Format format, String comment, byte[] bytes, List<Entry> entries) {
+        this(format, comment, bytes, entries, null);
+    }
+
+    PodArchive(Format format, String comment, byte[] bytes, List<Entry> entries, byte[] commentField) {
+        this(format, comment, bytes, entries, commentField, 0, List.of());
+    }
+
+    PodArchive(Format format, String comment, byte[] bytes, List<Entry> entries,
+            byte[] commentField, long checksum, List<AuditEntry> auditEntries) {
         this.format = Objects.requireNonNull(format);
         this.comment = Objects.requireNonNull(comment);
         this.bytes = Objects.requireNonNull(bytes);
         this.entries = List.copyOf(entries);
+        this.commentField = commentField;
+        this.checksum = checksum;
+        this.auditEntries = List.copyOf(auditEntries);
+    }
+
+    /**
+     * Returns the 80-byte comment field exactly as read, or {@code null} when the
+     * archive did not come from a POD1 header. Like a directory name field it can
+     * hold bytes after the terminator, so it is kept for writing back verbatim.
+     */
+    public byte[] getCommentField() {
+        return commentField;
     }
 
     public Format getFormat() {
@@ -91,6 +117,23 @@ public final class PodArchive {
     /** Returns an unmodifiable list of all directory entries in declaration order. */
     public List<Entry> getEntries() {
         return entries;
+    }
+
+    /** POD2 archive checksum, or zero for formats that do not carry one. */
+    public long getChecksum() { return checksum; }
+
+    /** POD2 audit trail in declaration order; empty for POD1 and EPD. */
+    public List<AuditEntry> getAuditEntries() { return auditEntries; }
+
+    /** True when the POD2 checksum over bytes 8..EOF matches the header. */
+    public boolean isChecksumValid() {
+        return format != Format.POD2
+                || checksum == PodArchiveWriter.crc32Mpeg2(bytes, 8, bytes.length - 8);
+    }
+
+    /** True when a POD2 entry's stored CRC matches its payload. */
+    public boolean isEntryChecksumValid(Entry entry) {
+        return format != Format.POD2 || entry.checksum() == PodArchiveWriter.crc32Mpeg2(getEntryBytes(entry));
     }
 
     /**
@@ -160,11 +203,70 @@ public final class PodArchive {
     /**
      * One entry in the POD directory table.
      *
-     * @param name    archive path of the entry (null-bytes stripped, ISO-8859-1)
-     * @param length  data length in bytes
-     * @param offset  byte offset of the data from the start of the POD file
+     * @param name      archive path of the entry (null-bytes stripped, ISO-8859-1)
+     * @param length    data length in bytes
+     * @param offset    byte offset of the data from the start of the POD file
+     * @param nameField the directory name field exactly as read, terminator and
+     *                  trailing bytes included, or {@code null} for entries that
+     *                  did not come from a POD1 directory
      */
-    public record Entry(String name, long length, long offset) {
+    public record Entry(String name, long length, long offset, byte[] nameField,
+                        long timestamp, long checksum) {
+
+        /** An entry with no original directory field, for synthetic use. */
+        public Entry(String name, long length, long offset) {
+            this(name, length, offset, null, 0, 0);
+        }
+
+        /** A POD1 entry retaining its original fixed-width directory field. */
+        public Entry(String name, long length, long offset, byte[] nameField) {
+            this(name, length, offset, nameField, 0, 0);
+        }
+
+        /**
+         * Returns the palette this entry's art was authored against, read from the
+         * second string in the directory field, or {@code null} when there is none.
+         *
+         * <p>The early Terminal Reality packer wrote it for every {@code .RAW}
+         * entry in MTM1, Terminal Velocity, Fury3, and Hellbender; MTM2 and CPR
+         * dropped the practice. Where it is present it is authoritative, and it
+         * names an {@code .ACT} that exists in the same archive.
+         */
+        public String embeddedPaletteName() {
+            return secondString(nameField);
+        }
+
+        /**
+         * Returns the second null-terminated string in a directory name field, or
+         * {@code null} when the field holds only a path.
+         *
+         * <p>Nothing upstream documents this string, and no reader here looks past
+         * the first terminator when locating entries. It is a hint for previewing
+         * art, nothing more.
+         */
+        public static String secondString(byte[] field) {
+            if (field == null) {
+                return null;
+            }
+            int first = -1;
+            for (int i = 0; i < field.length; i++) {
+                if (field[i] == 0) { first = i; break; }
+            }
+            if (first < 0 || first + 1 >= field.length) {
+                return null;
+            }
+            int start = first + 1;
+            int end = start;
+            while (end < field.length && field[end] != 0) {
+                end++;
+            }
+            if (end == start) {
+                return null;
+            }
+            String value = new String(field, start, end - start,
+                    java.nio.charset.StandardCharsets.ISO_8859_1).trim();
+            return value.isEmpty() ? null : value;
+        }
 
         /**
          * Returns the bare filename (no leading path) in upper-case.
@@ -175,4 +277,11 @@ public final class PodArchive {
             return (slash >= 0 ? name.substring(slash + 1) : name).toUpperCase(Locale.ROOT);
         }
     }
+
+    public enum AuditAction { ADD, REMOVE, CHANGE }
+
+    /** One 312-byte POD2 audit record. Times are unsigned Unix seconds. */
+    public record AuditEntry(String user, long timestamp, AuditAction action,
+                             String entryPath, long oldTimestamp, long oldSize,
+                             long newTimestamp, long newSize) {}
 }
