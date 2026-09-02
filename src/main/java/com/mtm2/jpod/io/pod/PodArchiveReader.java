@@ -41,6 +41,7 @@ public final class PodArchiveReader {
     private static final int POD1_64_NAME_SIZE   = 64;
     private static final int POD1_64_ENTRY_SIZE  = 72;
     private static final int POD2_ENTRY_SIZE     = 20;
+    private static final int POD2_AUDIT_SIZE     = 312;
     private static final int EPD_ENTRY_SIZE      = 80;
     private static final int POD1_HEADER_SIZE    = Integer.BYTES + POD_COMMENT_SIZE;
     private static final int POD2_HEADER_SIZE    = 8 + POD_COMMENT_SIZE + Integer.BYTES + Integer.BYTES;
@@ -82,17 +83,19 @@ public final class PodArchiveReader {
         }
 
         String comment = decodeNullTerminated(bytes, Integer.BYTES, POD_COMMENT_SIZE);
+        byte[] commentField = java.util.Arrays.copyOfRange(
+                bytes, Integer.BYTES, Integer.BYTES + POD_COMMENT_SIZE);
 
         List<PodArchive.Entry> classic =
                 tryReadPod1Directory(bytes, itemCount, POD_ENTRY_NAME_SIZE, POD1_ENTRY_SIZE);
         if (classic != null) {
-            return new PodArchive(PodArchive.Format.POD1, comment, bytes, classic);
+            return new PodArchive(PodArchive.Format.POD1, comment, bytes, classic, commentField);
         }
 
         List<PodArchive.Entry> extended =
                 tryReadPod1Directory(bytes, itemCount, POD1_64_NAME_SIZE, POD1_64_ENTRY_SIZE);
         if (extended != null) {
-            return new PodArchive(PodArchive.Format.POD1_64, comment, bytes, extended);
+            return new PodArchive(PodArchive.Format.POD1_64, comment, bytes, extended, commentField);
         }
 
         throw new IOException(
@@ -121,16 +124,20 @@ public final class PodArchiveReader {
         }
 
         List<PodArchive.Entry> entries = new ArrayList<>(itemCount);
+        long dataFloor = POD1_HEADER_SIZE + tableSize;
         for (int i = 0; i < itemCount; i++) {
             int entryOffset = POD1_HEADER_SIZE + i * entrySize;
             String name   = decodeNullTerminated(bytes, entryOffset, nameSize);
             long   length = Integer.toUnsignedLong(readInt32LE(bytes, entryOffset + nameSize));
             long   offset = Integer.toUnsignedLong(
                     readInt32LE(bytes, entryOffset + nameSize + Integer.BYTES));
-            if (!isPlausibleArchivePath(name) || !isInBounds(offset, length, bytes.length)) {
+            if (!isPlausibleArchivePath(name) || offset < dataFloor
+                    || !isInBounds(offset, length, bytes.length)) {
                 return null;
             }
-            entries.add(new PodArchive.Entry(name, length, offset));
+            byte[] nameField = java.util.Arrays.copyOfRange(
+                    bytes, entryOffset, entryOffset + nameSize);
+            entries.add(new PodArchive.Entry(name, length, offset, nameField));
         }
         return entries;
     }
@@ -193,6 +200,7 @@ public final class PodArchiveReader {
         }
 
         String comment = decodeNullTerminated(bytes, 8, POD_COMMENT_SIZE);
+        long archiveChecksum = Integer.toUnsignedLong(readInt32LE(bytes, 4));
         int itemCount = readInt32LE(bytes, 88);
         if (itemCount < 1 || itemCount > MAX_REASONABLE_ITEMS) {
             throw new IOException("Suspicious POD2 item count: " + itemCount);
@@ -205,19 +213,51 @@ public final class PodArchiveReader {
         }
 
         int nameTableOffset = tableOffset + tableSize;
+        int auditCount = readInt32LE(bytes, 92);
+        if (auditCount < 0 || auditCount > MAX_REASONABLE_ITEMS) {
+            throw new IOException("Suspicious POD2 audit count: " + auditCount);
+        }
         List<PodArchive.Entry> entries = new ArrayList<>(itemCount);
         for (int i = 0; i < itemCount; i++) {
             int entryOffset = tableOffset + i * POD2_ENTRY_SIZE;
             int pathOffset  = readInt32LE(bytes, entryOffset);
             long length     = Integer.toUnsignedLong(readInt32LE(bytes, entryOffset + 4));
             long offset     = Integer.toUnsignedLong(readInt32LE(bytes, entryOffset + 8));
+            long timestamp  = Integer.toUnsignedLong(readInt32LE(bytes, entryOffset + 12));
+            long checksum   = Integer.toUnsignedLong(readInt32LE(bytes, entryOffset + 16));
             String name     = decodeNullTerminated(bytes, nameTableOffset + pathOffset,
                     bytes.length - (nameTableOffset + pathOffset));
             validateEntryBounds(name, offset, length, bytes.length);
-            entries.add(new PodArchive.Entry(name, length, offset));
+            entries.add(new PodArchive.Entry(name, length, offset, null, timestamp, checksum));
         }
 
-        return new PodArchive(PodArchive.Format.POD2, comment, bytes, entries);
+        long auditOffset = entries.stream().mapToLong(e -> e.offset() + e.length()).max()
+                .orElse(nameTableOffset);
+        long auditBytes = (long) auditCount * POD2_AUDIT_SIZE;
+        if (auditOffset < 0 || auditOffset + auditBytes > bytes.length) {
+            throw new IOException("POD2 audit trail exceeds file size");
+        }
+        List<PodArchive.AuditEntry> audits = new ArrayList<>(auditCount);
+        for (int i = 0; i < auditCount; i++) {
+            int at = Math.toIntExact(auditOffset + (long) i * POD2_AUDIT_SIZE);
+            String user = decodeNullTerminated(bytes, at, 32);
+            long timestamp = Integer.toUnsignedLong(readInt32LE(bytes, at + 32));
+            int actionValue = readInt32LE(bytes, at + 36);
+            if (actionValue < 0 || actionValue >= PodArchive.AuditAction.values().length) {
+                throw new IOException("Invalid POD2 audit action: " + actionValue);
+            }
+            String entryPath = decodeNullTerminated(bytes, at + 40, 256);
+            long oldTimestamp = Integer.toUnsignedLong(readInt32LE(bytes, at + 296));
+            long oldSize = Integer.toUnsignedLong(readInt32LE(bytes, at + 300));
+            long newTimestamp = Integer.toUnsignedLong(readInt32LE(bytes, at + 304));
+            long newSize = Integer.toUnsignedLong(readInt32LE(bytes, at + 308));
+            audits.add(new PodArchive.AuditEntry(user, timestamp,
+                    PodArchive.AuditAction.values()[actionValue], entryPath,
+                    oldTimestamp, oldSize, newTimestamp, newSize));
+        }
+
+        return new PodArchive(PodArchive.Format.POD2, comment, bytes, entries,
+                null, archiveChecksum, audits);
     }
 
     private static boolean hasMagic(byte[] bytes, byte[] magic) {

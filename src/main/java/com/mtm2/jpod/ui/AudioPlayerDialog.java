@@ -23,7 +23,7 @@ public final class AudioPlayerDialog extends JDialog {
     private final Timer positionTimer;
 
     public AudioPlayerDialog(Frame owner, String entryName, byte[] data) {
-        super(owner, "Audio Player — " + entryName, false);
+        super(owner, "Audio Player - " + entryName, true);
         setDefaultCloseOperation(JDialog.DISPOSE_ON_CLOSE);
 
         positionTimer = new Timer(250, e -> updatePosition());
