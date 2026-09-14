@@ -1,11 +1,10 @@
 # Terminal Reality POD archive family: format specification
 
-Version 1.0.0, 2026-09-01.
+Version 2.0.0, 2026-09-10.
 
 Covers the container formats used by *Monster Truck Madness 1 and 2*, *Terminal
 Velocity*, *Fury3*, *Hellbender*, *CART Precision Racing*, *Nocturne*, *4x4 Evo*
-and *Fly!*: classic **POD1**, the **POD1-64** long-name extension, **POD2**, and
-**EPD**.
+and *Fly!*: **POD1**, **POD2** and **EPD**.
 
 A machine-readable companion, [`pod-format.json`](pod-format.json), encodes the
 same structures as data.
@@ -70,13 +69,13 @@ POD1 has no signature, so it is the fallback. Check signatures first. **[V]**
 |---|---|
 | `64 74 78 65` (`dtxe`) | EPD |
 | `50 4F 44 32` (`POD2`) | POD2 |
-| anything else | POD1 family: classic or POD1-64, resolved by validation ([§5.1](#51-detecting-which-pod1-directory-a-file-uses)) |
+| anything else | POD1, confirmed by validating its directory ([§4](#4-pod1)) |
 
 A file shorter than 84 bytes cannot be any member of the family.
 
 ---
 
-## 4. POD1 (classic)
+## 4. POD1
 
 The format of MTM1, MTM2, Terminal Velocity, Fury3, Hellbender and CPR. **[V]**
 
@@ -92,7 +91,7 @@ The comment field is a NUL-terminated string. Like a directory name field it may
 carry bytes after its terminator: in the community archive `POWER.POD` the field
 opens with a terminator and is followed by 79 bytes of heap junk. A reader takes
 the string and ignores the rest; a writer rebuilding that archive must put the
-original bytes back ([§8](#8-writer-rules) rule 5). **[V]**
+original bytes back ([§7](#7-writer-rules) rule 5). **[V]**
 
 ### 4.2 Directory entry
 
@@ -182,106 +181,12 @@ archive examined the last payload ends exactly at end of file. **[V]**
 
 ---
 
-## 5. POD1-64 (extended long-name directory)
-
-**[D]** The engine notes describe a second directory form used when a path
-exceeds the classic budget: "Any stem > 20 -> C-Pod writes the EXTENDED directory
-(64-byte names, version-tagged header; ~50-char stems). Only the new engine
-mounts these."
-
-**[I]** The layout below is what the readers in this family implement. No shipped
-extended archive was available to confirm it.
-
-### 5.1 Header
-
-Believed unchanged from classic POD1: a 4-byte count and an 80-byte comment, with
-the directory beginning at byte 84. **[I]**
-
-### 5.2 Directory entry
-
-Entry `i` begins at `84 + i * 72`. Each record is 72 bytes:
-
-| Relative offset | Size | Type | Field | Difference from classic |
-|---:|---:|---|---|---|
-| `0x00` | 64 | `char[64]` | Name field | Widened from 32 |
-| `0x40` | 4 | `uint32` | Payload length | Moved |
-| `0x44` | 4 | `uint32` | Absolute payload offset | Moved |
-
-The name budget becomes **63 bytes**. Nothing else changes: the payload region is
-still a plain concatenation addressed by offset and length. **[I]**
-
-Whether a palette record ([§4.4](#44-the-palette-record)) may appear in a 64-byte
-field is **[U]**. No producer of extended archives is known to write one. A
-reader should apply the same parse, since the rule costs nothing.
-
-### 5.3 Detecting which POD1 directory a file uses
-
-POD1 carries no version marker that any available archive exhibits, so the layout
-is resolved by validating it: **[I]**
-
-```
-read_pod1(bytes):
-    count = int32(bytes, 0)
-    reject unless 1 <= count <= 8192
-    comment = read_string(bytes, 4, 80)
-
-    for (name_width, record_size) in [(32, 40), (64, 72)]:
-        entries = try_directory(bytes, count, name_width, record_size)
-        if entries is not null:
-            return archive(entries, layout = name_width == 32 ? POD1 : POD1_64)
-    reject
-
-try_directory(bytes, count, name_width, record_size):
-    if 84 + count * record_size > len(bytes): return null
-    for i in 0 .. count-1:
-        base   = 84 + i * record_size
-        path   = read_string(bytes, base, name_width)
-        length = uint32(bytes, base + name_width)
-        offset = uint32(bytes, base + name_width + 4)
-        if not plausible_path(path):                      return null
-        if offset > len(bytes):                           return null
-        if length > len(bytes) - offset:                  return null
-    return entries
-
-plausible_path(s):
-    s is non-empty
-    and len(s) <= 63
-    and s contains no code point < 0x20
-    and s contains no ':'
-```
-
-Classic is tried first so an ordinary archive is never reported as extended.
-The bounds test is written as `offset > size or length > size - offset`, never
-`offset + length > size`, which can overflow 32-bit arithmetic. **[V]**
-
-### 5.4 The version tag
-
-**[U]** The engine notes say production extended archives carry a
-"version-tagged header". No available document gives the tag bytes, its offset, or
-the resulting directory origin. `CPOD_LONG_NAMES.md`, cited as the companion
-contract, was published on 2026-08-11 and is a naming-policy document: it fixes an
-18-character stem that must survive a pack and unpack round trip, notes the
-derived-name suffixes `_N`, `_AO`, `_MASK` and `_DTL` that consume 2 to 5
-characters, restates the 31-character POD1 field, and warns against internal
-`char[13]`, `char[16]` and `char[9]` buffers. It specifies no binary layout.
-`FILENAME_CONVENTIONS.md`, also cited, returns 404.
-
-Consequently:
-
-- The layout in [§5.2](#52-directory-entry) is the untagged interpretation.
-- A tagged archive whose directory does not begin at byte 84 will not be read by
-  this specification.
-- Retain any known-good extended archive as a fixture. If one appears, detection
-  must be revised from the observed bytes, not guessed.
-
----
-
-## 6. POD2
+## 5. POD2
 
 Used by *Nocturne* and *4x4 Evo 1 and 2*. **[I]** No POD2 archive was available;
 the layout below is what these readers implement, from published references.
 
-### 6.1 Header
+### 5.1 Header
 
 | Offset | Size | Type | Field |
 |---:|---:|---|---|
@@ -292,7 +197,7 @@ the layout below is what these readers implement, from published references.
 | `0x5C` | 4 | `uint32` | Audit-trail count |
 | `0x60` | | | Start of the directory table |
 
-### 6.2 Directory entry
+### 5.2 Directory entry
 
 Entry `i` begins at `96 + i * 20`. Each record is 20 bytes:
 
@@ -304,14 +209,14 @@ Entry `i` begins at `96 + i * 20`. Each record is 20 bytes:
 | `0x0C` | 4 | `uint32` | Unix timestamp |
 | `0x10` | 4 | `uint32` | Payload CRC-32 |
 
-### 6.3 Name table
+### 5.3 Name table
 
 Immediately after the directory, at `96 + count * 20`, sits a blob of
 NUL-terminated names. Each entry's name begins at `name_table_origin + path_offset`
 and runs to its terminator. Names are variable length, so the 31-byte budget of
 POD1 does not apply.
 
-### 6.4 Checksums and audit trail
+### 5.4 Checksums and audit trail
 
 POD2 uses the non-reflected CRC-32 polynomial `0x04C11DB7`, initial value
 `0xFFFFFFFF`, and no final XOR (the CRC-32/MPEG-2 convention). The archive CRC
@@ -325,11 +230,11 @@ for add, remove, replace, rename, and move operations. **[I]**
 
 ---
 
-## 7. EPD
+## 6. EPD
 
 Used by *Fly!*. **[V]** against one archive, `SC24.EPD`, 54 entries.
 
-### 7.1 Header
+### 6.1 Header
 
 | Offset | Size | Type | Field |
 |---:|---:|---|---|
@@ -340,7 +245,7 @@ Used by *Fly!*. **[V]** against one archive, `SC24.EPD`, 54 entries.
 | `0x94` | 124 | | Unidentified, non-zero |
 | `0x110` | | | Start of the directory table |
 
-### 7.2 Directory entry
+### 6.2 Directory entry
 
 Entry `i` begins at `0x110 + i * 80`. Each record is 80 bytes:
 
@@ -353,7 +258,7 @@ Entry `i` begins at `0x110 + i * 80`. Each record is 80 bytes:
 | `0x48` | 4 | `uint32` | Timestamp, Unix epoch seconds |
 | `0x4C` | 4 | `uint32` | Unidentified, distinct per entry, probably a checksum |
 
-### 7.3 Reconstructing the path
+### 6.3 Reconstructing the path
 
 The name is split across the 4-byte prefix and the 60-byte remainder: **[V]**
 
@@ -370,7 +275,7 @@ A lower-case prefix is rejected by the `[A-Z0-9_]` test and the remainder is use
 alone, which is deliberate: it distinguishes a directory prefix from payload that
 happens to sit in those four bytes.
 
-### 7.4 Padding is uninitialised memory
+### 6.4 Padding is uninitialised memory
 
 **[V]** Unlike POD1, the space after an EPD name's terminator holds heap junk. In
 `SC24.EPD` all 54 records are padded with the repeating pattern `BA AD F0 0D`, the
@@ -385,19 +290,21 @@ writers should zero-fill rather than reproduce it.
 
 ---
 
-## 8. Writer rules
+## 7. Writer rules
 
 **[V]** unless noted.
 
-1. **Choose the narrowest directory for a new POD1 archive.** Emit classic POD1
-   when every complete directory field fits in 32 bytes. Promote to POD1-64 when
-   a path or embedded palette record requires it. Preserve POD1-64 when rewriting
-   an archive loaded with the wider layout unless conversion was explicitly chosen.
+1. **There is one POD1 directory and it is 40 bytes.** Emit `char name[32]`,
+   `int32 size`, `int32 offset`. Never widen it, whatever the names require:
+   the directory entry is a direct on-disk overlay, read straight into
+   `fileEntryStruct`, and widening it produces a volume the engine rejects at
+   mount rather than an archive with longer names.
 2. **Count the whole path.** Any prefix such as `ART\` or `MODELS\`, the stem, the
-   extension, and the terminator all count against the budget.
-3. **Reject, do not truncate.** A path that does not fit the widest available
-   field is an error. Silently shortening a name produces an archive that mounts
-   and then fails to find its own content.
+   extension, and the terminator all count against the 31-byte budget, as does an
+   embedded palette record and its own terminator.
+3. **Reject, do not truncate.** A path that does not fit is an error naming the
+   entry and its length. Silently shortening a name produces an archive that
+   mounts and then fails to find its own content.
 4. **NUL-terminate every name.**
 5. **Preserve fixed-width fields when rebuilding an existing archive.** An entry
    read from an archive should be written back with its original name field byte
@@ -413,12 +320,12 @@ writers should zero-fill rather than reproduce it.
 8. **Do not invent palette records.** MTM2-era tools never wrote them, and no
    engine is known to read them.
 9. **Renames preserve RAW metadata.** Rebuild the directory field with the new
-   path and the original second palette string; promote if needed, and reject the
-   edit if the complete field cannot fit 64 bytes.
+   path and the original second palette string, and reject the edit if the
+   complete field cannot fit 32 bytes.
 10. **POD2 is explicit.** POD1 is the authoring default. POD2 serialization and
     conversion are selected deliberately and must not affect POD1 detection or layout.
 
-### 8.1 Round-trip property
+### 7.1 Round-trip property
 
 A conforming writer, given the entries of an archive in their original order with
 their original comment and name fields, reproduces that archive byte for byte.
@@ -428,7 +335,7 @@ every surveyed archive satisfies. **[V]**
 
 ---
 
-## 9. Validation
+## 8. Validation
 
 A reader should reject an archive when any of the following holds. All were
 observed to be necessary while distinguishing the two POD1 directory widths. **[V]**
@@ -502,9 +409,8 @@ it is why a reader must not treat post-terminator bytes as meaningful by default
 
 ### A.5 Not covered
 
-- No POD1-64 archive was available. Everything in [§5](#5-pod1-64-extended-long-name-directory) marked **[I]** is unverified.
-- No POD2 archive was available. All of [§6](#6-pod2) is unverified.
-- One EPD archive was available, so [§7](#7-epd) rests on a single sample.
+- No POD2 archive was available. All of [§5](#5-pod2) is unverified.
+- One EPD archive was available, so [§6](#6-epd) rests on a single sample.
 
 ---
 
@@ -524,8 +430,9 @@ never let its contents affect entry lookup.
 
 ## References
 
-- [MTM2 Engine Content Limits](https://www.mtm2.com/~mtmg/misc/ENGINE_LIMITS.md) - POD1 name budgets, the extended-directory design note
-- [C-Pod long-name contract](https://www.mtm2.com/~mtmg/misc/CPOD_LONG_NAMES.md) - naming policy, 2026-08-11. No binary layout
+- [POD1 format hand-over](https://www.mtm2.com/~mtmg/misc/POD1_FORMAT_HANDOVER.md) - the container layout checked against `engine\pod.h` and `engine\pod.cpp`, 2026-09-09. Supersedes the extended-directory reading of the two notes below
+- [MTM2 Engine Content Limits](https://www.mtm2.com/~mtmg/misc/ENGINE_LIMITS.md) - POD1 name budgets
+- [C-Pod long-name contract](https://www.mtm2.com/~mtmg/misc/CPOD_LONG_NAMES.md) - naming policy, 2026-08-11. No binary layout. Its §9 64-byte name fields are `.bin` model records
 - [Monster Truck Madness Guild](https://www.mtm2.com/%7Emtmg/index.shtml)
 - [EPD Format Reference](https://github.com/jopadan/termpod/wiki/EPD-Format-Reference)
 - [Pod 2 Format Reference](https://github.com/jopadan/termpod/wiki/Pod-2-Format-Reference)

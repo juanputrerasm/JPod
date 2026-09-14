@@ -7,7 +7,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 
-/** Shared pre-save and opened-archive validation for POD1/POD1-64/POD2. */
+/** Shared pre-save and opened-archive validation for POD1/POD2. */
 public final class PodArchiveValidator {
     private PodArchiveValidator() {}
 
@@ -27,9 +27,6 @@ public final class PodArchiveValidator {
                     new PodArchiveWriter.WriteOptions(requested, null, List.of()));
         } catch (IOException | IllegalArgumentException | ArithmeticException ex) {
             errors.add(ex.getMessage());
-        }
-        if (actual == PodArchive.Format.POD1_64 && requested == PodArchive.Format.POD1) {
-            warnings.add("The archive requires the Extended POD1 directory.");
         }
         return new Result(actual, List.copyOf(errors), List.copyOf(warnings));
     }

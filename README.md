@@ -9,9 +9,8 @@
 
 JPod opens, browses, previews, extracts and builds the `POD` archives used by
 *Monster Truck Madness 1 & 2*, *CART Precision Racing*, *Hellbender*, *Terminal
-Velocity*, *Fury3* and their relatives. It reads and writes both the classic POD1
-directory and the Community Patch 3 **POD1-64** extension with 64-byte entry
-names. It also reads and explicitly authors `POD2`; `EPD` remains read-only.
+Velocity*, *Fury3* and their relatives. It reads and writes the `POD1` directory
+and reads and explicitly authors `POD2`; `EPD` remains read-only.
 
 Written in Java 17 with Swing, so it runs on Windows, macOS and Linux with no
 dependencies beyond the JDK. [KPod](https://github.com/juanputrerasm/KPod) is the
@@ -30,7 +29,6 @@ in its own directory field.*
 | Format | Games | Support |
 |---|---|---|
 | `POD1` | MTM 1 & 2, CPR, Hellbender, Terminal Velocity, Fury3 | browse, preview, extract, save |
-| `POD1-64` (Extended POD1) | Community Patch 3 content | browse, preview, extract, save |
 | `POD2` | Nocturne, 4x4 Evo 1 & 2 | browse, preview, extract, explicit save/conversion, CRC, timestamp and audit history |
 | `EPD` | Fly! | browse, preview, extract |
 
@@ -136,31 +134,22 @@ and detects duplicates.
 
 ---
 
-## POD1-64 (Extended POD1)
+## The POD1 name budget
 
-POD1-64 is the Community Patch 3 long-name extension. It is not a 64-bit archive
-format and it is not EPD: the 64 refers only to the widened directory name field.
+MTM2 reads exactly one POD layout. Its directory entries are 40 bytes:
+`char name[32]`, `int32 size`, `int32 offset`, holding paths of up to 31
+characters. A directory table that does not validate as 40-byte records is a
+malformed archive, and JPod refuses it.
 
-| Property | Classic POD1 | POD1-64 |
-|---|---:|---:|
-| Header | 84 bytes | 84 bytes |
-| Directory name field | 32 bytes | 64 bytes |
-| Longest name | 31 bytes | 63 bytes |
-| Directory record | 40 bytes | 72 bytes |
-| Directory entry `i` starts at | `84 + i * 40` | `84 + i * 72` |
+JPod refuses a name that does not fit rather than truncating it. A truncated name
+packs without error and then simply never resolves in game, which is far harder to
+diagnose than a refusal. The whole stored record counts against the 31 bytes: the
+path, its terminator, and on a `.RAW` entry any embedded palette name and its
+terminator.
 
-POD1 has no magic value, so JPod detects the layout by validating it. The classic
-40-byte directory is tried first and accepted only when every record decodes to a
-plausible non-empty path whose byte range lies inside the file and does not begin
-before the directory ends; the 72-byte layout is tried only if the classic table
-fails. That ordering keeps ordinary archives from being reported as extended. The
-title bar shows `Extended POD1` when the wider directory was used.
-
-For a new archive, JPod emits classic POD1 whenever every complete directory field
-fits, and promotes to POD1-64 only when a path or embedded RAW palette record needs
-the wider field. An opened POD1-64 archive stays extended. The whole stored record
-counts, including the path, terminators and palette name. Data that cannot fit 64
-bytes is rejected rather than truncated.
+Authoring guidance goes further and keeps the *stem* to 18 characters, because the
+engine builds sibling names from it and every derived name must still fit 31.
+`ART\` plus an 18-character stem plus `_MASK` plus `.PNG` is exactly 31.
 
 ---
 
@@ -225,8 +214,7 @@ java -jar jpod.jar /path/to/GAME.POD
 ### Status bar
 
 `Size` is what the archive would occupy if saved now, which is why it changes as
-entries are added and removed, and why it grows by 32 bytes per entry the moment a
-name forces the POD1-64 directory. `Files` and `Selected` are counts, `unsaved`
+entries are added and removed. `Files` and `Selected` are counts, `unsaved`
 appears once the list differs from what is on disk, and the square at the right
 edge turns red while an operation is running.
 
@@ -242,7 +230,7 @@ mvn test             # runs the format and manifest tests
 java -jar target/jpod.jar
 ```
 
-The test suite covers POD1 and POD1-64 detection, directory-field and palette
+The test suite covers POD1 detection, directory-field and palette
 preservation, name-length boundaries, payload bounds, POD2 checksums and audit
 records, and a set of stable SHA-256 authoring vectors shared with KPod that prove
 both ports emit identical bytes.
@@ -283,8 +271,8 @@ src/test/java/com/mtm2/jpod/io/
 
 ## Format specification
 
-[`docs/POD_FORMAT.md`](docs/POD_FORMAT.md) specifies the whole POD family: classic
-POD1, the POD1-64 long-name extension, POD2 and EPD. It covers the palette record
+[`docs/POD_FORMAT.md`](docs/POD_FORMAT.md) specifies the whole POD family: POD1,
+POD2 and EPD. It covers the palette record
 the early Terminal Reality packer stored in the spare bytes of each RAW entry's
 name field, which is documented nowhere else, and it marks every claim as verified
 against shipped archives, documented upstream, implemented but unconfirmed, or

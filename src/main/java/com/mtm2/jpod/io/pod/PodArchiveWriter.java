@@ -23,22 +23,20 @@ import java.util.List;
  *   …         raw file data concatenated in directory order
  * </pre>
  *
- * <p>When at least one entry name does not fit in the classic 31-byte budget,
- * the POD1-64 directory is emitted instead: the header is unchanged, but the
- * name field is 64 bytes wide and each record is therefore 72 bytes. Classic
- * POD1 is preferred whenever every name fits, because extended archives can
- * only be opened by updated engines and tools.
+ * <p>A name that does not fit the 31-byte budget is a refusal naming the entry and
+ * its length, never a truncation: a truncated name packs without error and then
+ * simply never resolves in game.
  *
  * <p>Entry names are written exactly as supplied; callers are responsible for
- * uppercasing if the target game requires it.
+ * uppercasing if the target game requires it. The engine uppercases every name at
+ * mount, so lowercase resolves, but every shipped pod stores uppercase and writing
+ * it keeps round trips byte-identical.
  */
 public final class PodArchiveWriter {
 
     private static final int COMMENT_SIZE    = 80;
     private static final int ENTRY_NAME_SIZE = 32;
     private static final int ENTRY_SIZE      = 40;
-    /** POD1-64 name field; the extra 32 bytes make each record 72 bytes wide. */
-    private static final int LONG_NAME_SIZE  = 64;
     private static final int POD2_HEADER_SIZE = 96;
     private static final int POD2_ENTRY_SIZE = 20;
     /**
@@ -48,8 +46,8 @@ public final class PodArchiveWriter {
      */
     private static final int MAX_ITEMS       = 8192;
 
-    /** Longest entry name the POD1-64 directory can store, excluding the terminator. */
-    public static final int MAX_NAME_LENGTH  = LONG_NAME_SIZE - 1;
+    /** Longest entry name a POD1 directory can store, excluding the terminator. */
+    public static final int MAX_NAME_LENGTH  = ENTRY_NAME_SIZE - 1;
 
     /**
      * Builds the archive bytes and writes them atomically to {@code path}.
@@ -59,8 +57,8 @@ public final class PodArchiveWriter {
      * @param path    destination file (created or overwritten)
      * @param comment up to 79-byte archive comment (rejected if longer)
      * @param blobs   ordered list of entries to pack; must not be empty
-     * @return the directory layout written, {@link PodArchive.Format#POD1} or
-     *         {@link PodArchive.Format#POD1_64}
+     * @return the directory layout written: {@link PodArchive.Format#POD1}, or
+     *         {@link PodArchive.Format#POD2} when that was requested
      * @throws IllegalArgumentException if {@code blobs} is null or empty
      * @throws IOException              if any entry count exceeds {@value MAX_ITEMS},
      *                                  if a name is longer than
@@ -96,30 +94,22 @@ public final class PodArchiveWriter {
     }
 
     /**
-     * Returns the directory layout that {@link #buildBytes} would use for
-     * {@code blobs}: {@link PodArchive.Format#POD1_64} if any name needs more
-     * than the classic 31-byte budget, otherwise {@link PodArchive.Format#POD1}.
-     *
-     * <p>The whole stored path counts, including any {@code ART\} or
-     * {@code MODELS\} prefix, the extension, and the null terminator.
+     * Returns the directory layout {@link #buildBytes} would use for {@code blobs},
+     * which for the POD1 family is always {@link PodArchive.Format#POD1}.
      */
     public static PodArchive.Format formatFor(List<Blob> blobs) {
         return actualFormat(blobs, PodArchive.Format.POD1);
     }
 
-    /** Resolves automatic POD1-64 promotion while respecting an explicit format. */
+    /**
+     * Validates the requested output format.
+     *
+     * @throws IllegalArgumentException if {@code requested} is not a writable format
+     */
     public static PodArchive.Format actualFormat(List<Blob> blobs, PodArchive.Format requested) {
         if (requested == PodArchive.Format.POD2) return requested;
-        if (requested != PodArchive.Format.POD1 && requested != PodArchive.Format.POD1_64) {
-            throw new IllegalArgumentException("Unsupported output format: " + requested);
-        }
-        if (requested == PodArchive.Format.POD1_64) return requested;
-        for (Blob blob : blobs) {
-            if (requiredNameFieldLength(blob) > ENTRY_NAME_SIZE) {
-                return PodArchive.Format.POD1_64;
-            }
-        }
-        return PodArchive.Format.POD1;
+        if (requested == PodArchive.Format.POD1) return requested;
+        throw new IllegalArgumentException("Unsupported output format: " + requested);
     }
 
     /**
@@ -128,8 +118,8 @@ public final class PodArchiveWriter {
      * <p>Offsets in the directory table are computed automatically; the caller
      * does not need to pre-calculate them.
      *
-     * <p>The classic 40-byte directory is used when every name fits in 31
-     * bytes; otherwise the 72-byte POD1-64 directory is used.
+     * <p>The POD1 directory is always the 40-byte record. A name that does not fit
+     * in 31 bytes is refused, not truncated and not widened.
      *
      * @param comment up to 79-character archive comment
      * @param blobs   entries to include; order determines directory and data layout
@@ -154,24 +144,21 @@ public final class PodArchiveWriter {
                 new WriteOptions(PodArchive.Format.POD1, commentField, List.of()));
     }
 
-    /** Builds POD1/POD1-64 or POD2 according to explicit write options. */
+    /** Builds POD1 or POD2 according to explicit write options. */
     public byte[] buildBytes(String comment, List<Blob> blobs, WriteOptions options) throws IOException {
         validateInputs(comment, blobs, options.allowDuplicateNames());
         PodArchive.Format actual = actualFormat(blobs, options.format());
         if (actual == PodArchive.Format.POD2) {
             return buildPod2(comment, blobs, options.auditEntries());
         }
-        return buildPod1(comment, blobs, options.commentField(), actual);
+        return buildPod1(comment, blobs, options.commentField());
     }
 
-    private byte[] buildPod1(String comment, List<Blob> blobs, byte[] commentField,
-            PodArchive.Format actual) throws IOException {
-        int nameSize = actual == PodArchive.Format.POD1_64 ? LONG_NAME_SIZE : ENTRY_NAME_SIZE;
+    private byte[] buildPod1(String comment, List<Blob> blobs, byte[] commentField)
+            throws IOException {
+        int nameSize = ENTRY_NAME_SIZE;
         for (Blob blob : blobs) {
-            if (requiredNameFieldLength(blob) > nameSize) {
-                throw new IOException("POD entry name/palette exceeds " + (nameSize - 1)
-                        + " usable bytes: " + blob.name());
-            }
+            checkNameFits(blob);
         }
         int entrySize  = nameSize + Integer.BYTES + Integer.BYTES;
         int headerSize = Math.addExact(Integer.BYTES + COMMENT_SIZE,
@@ -345,6 +332,31 @@ public final class PodArchiveWriter {
         return name != null ? name.getBytes(StandardCharsets.ISO_8859_1).length : 0;
     }
 
+    /**
+     * Refuses a name the 32-byte directory field cannot hold, naming the entry and the
+     * length so the author can shorten it. Never truncates: a truncated name packs
+     * without error and then fails to match at load time, which is far harder to
+     * diagnose than a refusal.
+     *
+     * <p>The whole stored path counts, including any {@code ART\} or {@code MODELS\}
+     * prefix, the extension and the terminator, and, on the {@code .RAW} entries that
+     * carry one, the embedded {@code .ACT} palette record after it. A palette record
+     * that no longer fits is reported separately, because dropping it loses producer
+     * data that was in the file and shortening the path is not the only remedy.
+     */
+    private static void checkNameFits(Blob blob) throws IOException {
+        int name = nameByteLength(blob.name());
+        if (name > MAX_NAME_LENGTH) {
+            throw new IOException("POD entry name is " + name + " bytes; POD1 holds "
+                    + MAX_NAME_LENGTH + ": " + blob.name());
+        }
+        if (requiredNameFieldLength(blob) > ENTRY_NAME_SIZE) {
+            throw new IOException("POD entry name plus its embedded palette record is "
+                    + requiredNameFieldLength(blob) + " bytes; the directory field holds "
+                    + ENTRY_NAME_SIZE + ": " + blob.name() + " + " + blob.embeddedPaletteName());
+        }
+    }
+
     private static int requiredNameFieldLength(Blob blob) {
         int length = nameByteLength(blob.name()) + 1;
         String palette = blob.embeddedPaletteName();
@@ -437,8 +449,7 @@ public final class PodArchiveWriter {
      * An in-memory entry to be packed into a POD archive.
      *
      * @param name archive entry name (e.g. {@code "ART\\WALL01.RAW"});
-     *             at most {@value PodArchiveWriter#MAX_NAME_LENGTH} bytes, and
-     *             names over 31 bytes force the POD1-64 directory
+     *             at most {@value PodArchiveWriter#MAX_NAME_LENGTH} bytes
      * @param data raw file content
      * @param nameField the directory field this entry was read from, written back
      *                  verbatim when it fits, or {@code null} to build the field

@@ -17,13 +17,14 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Covers classic POD1 and POD1-64 directory detection, round-tripping, and the
- * rejection rules from the POD1-64 format notes.
+ * Covers POD1 directory detection, round-tripping, and the rejection rules from the
+ * POD1 format hand-over: 40-byte records, a 31-character name budget, and a refusal
+ * rather than a truncation or a wider directory when a name overruns it.
  */
 class PodArchiveFormatTest {
 
     private static final String SHORT_NAME = "ART\\WALL01.RAW";
-    /** 40 bytes, longer than the classic 31-byte budget but inside the 63-byte one. */
+    /** 40 bytes, past the 31-byte budget a POD1 directory field can hold. */
     private static final String LONG_NAME = "MODELS\\TRUCKS\\CUSTOM_BIGFOOT_WHEEL01.RAW";
 
     @TempDir
@@ -48,62 +49,71 @@ class PodArchiveFormatTest {
     }
 
     @Test
-    void oneLongNameSwitchesTheWholeDirectoryToPod1_64() throws IOException {
-        Path file = temp.resolve("extended.pod");
-        PodArchive.Format written = new PodArchiveWriter().write(file, "extended archive",
-                List.of(blob(SHORT_NAME, 10), blob(LONG_NAME, 20)));
+    void oneLongNameIsRefused() {
+        Path file = temp.resolve("overlong.pod");
+        List<PodArchiveWriter.Blob> blobs = List.of(blob(SHORT_NAME, 10), blob(LONG_NAME, 20));
 
-        assertEquals(PodArchive.Format.POD1_64, written);
+        IOException ex = assertThrows(IOException.class,
+                () -> new PodArchiveWriter().write(file, "overlong archive", blobs));
 
-        PodArchive archive = new PodArchiveReader().read(file);
-        assertEquals(PodArchive.Format.POD1_64, archive.getFormat());
-        assertEquals("Extended POD1", archive.getFormat().displayName());
-        assertTrue(archive.isPod1Family());
-        assertEquals("extended archive", archive.getComment());
-        assertEquals(List.of(SHORT_NAME, LONG_NAME),
-                archive.getEntries().stream().map(PodArchive.Entry::name).toList());
-        // 72-byte records place the first payload after the wider table.
-        assertEquals(84 + 2 * 72, archive.getEntries().get(0).offset());
-        assertArrayEquals(payload(20), archive.getEntryBytes(archive.getEntries().get(1)));
+        assertTrue(ex.getMessage().contains(LONG_NAME), ex.getMessage());
+        assertTrue(ex.getMessage().contains("31"), ex.getMessage());
     }
 
     @Test
-    void nameOfExactly31BytesStaysClassic() throws IOException {
+    void nameOfExactly31BytesFits() throws IOException {
         String name = "A".repeat(31);
         assertEquals(PodArchive.Format.POD1,
                 new PodArchiveWriter().write(temp.resolve("edge31.pod"), "", List.of(blob(name, 4))));
     }
 
     @Test
-    void nameOfExactly32BytesNeedsPod1_64() throws IOException {
-        String name = "A".repeat(32);
-        Path file = temp.resolve("edge32.pod");
-        assertEquals(PodArchive.Format.POD1_64,
-                new PodArchiveWriter().write(file, "", List.of(blob(name, 4))));
-        assertEquals(name, new PodArchiveReader().read(file).getEntries().get(0).name());
-    }
+    void nameOfExactly32BytesIsRejected() {
+        // 32 characters leaves no room for the terminator the engine scans for.
+        List<PodArchiveWriter.Blob> blobs = List.of(blob("A".repeat(32), 4));
 
-    @Test
-    void nameTooLongForPod1_64IsRejected() {
-        List<PodArchiveWriter.Blob> blobs = List.of(blob("A".repeat(64), 4));
         IOException ex = assertThrows(IOException.class,
                 () -> new PodArchiveWriter().buildBytes("", blobs));
-        assertTrue(ex.getMessage().contains("63"), ex.getMessage());
+
+        assertTrue(ex.getMessage().contains("32 bytes"), ex.getMessage());
+        assertTrue(ex.getMessage().contains("31"), ex.getMessage());
     }
 
     @Test
-    void handWrittenPod1_64DirectoryIsDetected() throws IOException {
+    void anOverlongNameIsNeverSilentlyTruncated() throws IOException {
+        // A truncated name packs without error and then simply never resolves in game,
+        // which is far harder to diagnose than a refusal.
+        String name = "ART\\" + "A".repeat(40) + ".RAW";
+        assertThrows(IOException.class,
+                () -> new PodArchiveWriter().buildBytes("", List.of(blob(name, 4))));
+
+        Path file = temp.resolve("nothing-written.pod");
+        assertThrows(IOException.class,
+                () -> new PodArchiveWriter().write(file, "", List.of(blob(name, 4))));
+        assertTrue(Files.notExists(file), "a refused write must not leave a file behind");
+    }
+
+    @Test
+    void aSeventyTwoByteDirectoryIsRefused() throws IOException {
+        // A directory of 72-byte records is not a POD1 directory. The engine walks a POD1
+        // directory in 40-byte steps and refuses the volume, and so does this reader.
         Path file = temp.resolve("handmade.pod");
         Files.write(file, handWrittenArchive(64, 72, LONG_NAME, payload(6)));
 
-        PodArchive archive = new PodArchiveReader().read(file);
-        assertEquals(PodArchive.Format.POD1_64, archive.getFormat());
-        assertEquals(LONG_NAME, archive.getEntries().get(0).name());
-        assertArrayEquals(payload(6), archive.getEntryBytes(archive.getEntries().get(0)));
+        assertThrows(IOException.class, () -> new PodArchiveReader().read(file));
     }
 
     @Test
-    void classicLayoutWinsWhenBothCouldParse() throws IOException {
+    void aSeventyTwoByteDirectoryIsRefusedEvenWhenItsNamesWouldFit() throws IOException {
+        // Nothing about the names makes the record stride right.
+        Path file = temp.resolve("shortnames72.pod");
+        Files.write(file, handWrittenArchive(64, 72, SHORT_NAME, payload(6)));
+
+        assertThrows(IOException.class, () -> new PodArchiveReader().read(file));
+    }
+
+    @Test
+    void aFortyByteDirectoryIsAccepted() throws IOException {
         Path file = temp.resolve("ambiguous.pod");
         Files.write(file, handWrittenArchive(32, 40, SHORT_NAME, payload(6)));
 
@@ -230,7 +240,7 @@ class PodArchiveFormatTest {
     }
 
     @Test
-    void aPreservedClassicFieldStillFitsWhenTheArchiveGoesExtended() throws IOException {
+    void aPreservedFieldSurvivesAlongsideAFreshlyAddedEntry() throws IOException {
         Path source = temp.resolve("mixed.pod");
         byte[] bytes = handWrittenArchive(32, 40, SHORT_NAME, payload(6));
         byte[] extra = "VGA.ACT".getBytes(StandardCharsets.ISO_8859_1);
@@ -240,18 +250,16 @@ class PodArchiveFormatTest {
         PodArchive archive = new PodArchiveReader().read(source);
         PodArchive.Entry original = archive.getEntries().get(0);
 
-        // Adding a long-named entry forces the 64-byte directory; the preserved
-        // 32-byte field must be copied into it rather than dropped.
         List<PodArchiveWriter.Blob> blobs = List.of(
                 new PodArchiveWriter.Blob(
                         original.name(), archive.getEntryBytes(original), original.nameField()),
-                blob(LONG_NAME, 4));
+                blob("ART\\ADDED.RAW", 4));
         Path target = temp.resolve("mixed-out.pod");
-        assertEquals(PodArchive.Format.POD1_64,
+        assertEquals(PodArchive.Format.POD1,
                 new PodArchiveWriter().write(target, archive.getComment(), blobs));
 
         byte[] written = Files.readAllBytes(target);
-        byte[] field = java.util.Arrays.copyOfRange(written, 84, 84 + 64);
+        byte[] field = java.util.Arrays.copyOfRange(written, 84, 84 + 32);
         assertEquals("VGA.ACT", new String(
                 field, SHORT_NAME.length() + 1, extra.length, StandardCharsets.ISO_8859_1));
     }
@@ -289,23 +297,13 @@ class PodArchiveFormatTest {
     }
 
     @Test
-    void anExplicitExtendedSaveNeverCollapsesToClassic() throws IOException {
-        PodArchiveWriter writer = new PodArchiveWriter();
-        List<PodArchiveWriter.Blob> blobs = List.of(blob("SHORT.RAW", 4));
-        byte[] bytes = writer.buildBytes("", blobs, new PodArchiveWriter.WriteOptions(
-                PodArchive.Format.POD1_64, null, List.of()));
-        Path file = temp.resolve("forced.pod");
-        Files.write(file, bytes);
-        assertEquals(PodArchive.Format.POD1_64, new PodArchiveReader().read(file).getFormat());
-        assertEquals(84 + 72 + 4, bytes.length);
-    }
-
-    @Test
-    void extendedArchiveWithPaletteRoundTripsByteForByte() throws IOException {
-        byte[] original = handWrittenArchive(64, 72, LONG_NAME, payload(7));
+    void aPod1ArchiveWithAPaletteRoundTripsByteForByte() throws IOException {
+        // The regression guard that matters most: a legacy pod must come back out
+        // byte-identical, spare bytes after the terminator included.
+        byte[] original = handWrittenArchive(32, 40, SHORT_NAME, payload(7));
         byte[] palette = "VGA.ACT".getBytes(StandardCharsets.ISO_8859_1);
-        System.arraycopy(palette, 0, original, 84 + LONG_NAME.length() + 1, palette.length);
-        Path path = temp.resolve("extended-palette.pod");
+        System.arraycopy(palette, 0, original, 84 + SHORT_NAME.length() + 1, palette.length);
+        Path path = temp.resolve("pod1-palette.pod");
         Files.write(path, original);
         PodArchive archive = new PodArchiveReader().read(path);
         PodArchive.Entry entry = archive.getEntries().get(0);
@@ -324,15 +322,32 @@ class PodArchiveFormatTest {
         System.arraycopy(oldName, 0, original, 0, oldName.length);
         System.arraycopy(palette, 0, original, oldName.length + 1, palette.length);
         PodArchiveWriter.Blob renamed = new PodArchiveWriter.Blob(
-                "ART\\A_LONGER_RENAMED_TEXTURE.RAW", payload(4), original, "METALCR2.ACT", 0);
+                "ART\\RENAMED.RAW", payload(4), original, "METALCR2.ACT", 0);
 
         byte[] bytes = new PodArchiveWriter().buildBytes("", List.of(renamed));
         Path file = temp.resolve("renamed.pod");
         Files.write(file, bytes);
         PodArchive.Entry entry = new PodArchiveReader().read(file).getEntries().get(0);
-        assertEquals("ART\\A_LONGER_RENAMED_TEXTURE.RAW", entry.name());
+        assertEquals("ART\\RENAMED.RAW", entry.name());
         assertEquals("METALCR2.ACT", entry.embeddedPaletteName());
-        assertEquals(PodArchive.Format.POD1_64, new PodArchiveReader().read(file).getFormat());
+        assertEquals(PodArchive.Format.POD1, new PodArchiveReader().read(file).getFormat());
+    }
+
+    @Test
+    void aRenameWhosePaletteRecordNoLongerFitsIsRefused() throws IOException {
+        // Name plus terminator plus palette plus terminator must fit the 32-byte field.
+        // Refusing names the palette too, because shortening the path is not the only
+        // remedy - the caller can also clear the hint.
+        byte[] original = new byte[32];
+        byte[] oldName = "OLD.RAW".getBytes(StandardCharsets.ISO_8859_1);
+        System.arraycopy(oldName, 0, original, 0, oldName.length);
+        PodArchiveWriter.Blob renamed = new PodArchiveWriter.Blob(
+                "ART\\A_MUCH_LONGER_NAME.RAW", payload(4), original, "METALCR2.ACT", 0);
+
+        IOException ex = assertThrows(IOException.class,
+                () -> new PodArchiveWriter().buildBytes("", List.of(renamed)));
+
+        assertTrue(ex.getMessage().contains("METALCR2.ACT"), ex.getMessage());
     }
 
     @Test
@@ -359,17 +374,16 @@ class PodArchiveFormatTest {
         PodArchiveWriter writer = new PodArchiveWriter();
         byte[] classic = writer.buildBytes("vector", List.of(
                 new PodArchiveWriter.Blob("A.TXT", new byte[] {1, 2, 3}, null, null, 0)));
-        byte[] extended = writer.buildBytes("vector", List.of(
+        byte[] palette = writer.buildBytes("vector", List.of(
                 new PodArchiveWriter.Blob("ART\\T.RAW", new byte[] {4, 5}, null,
-                        "METALCR2.ACT", 0)),
-                new PodArchiveWriter.WriteOptions(PodArchive.Format.POD1_64, null, List.of()));
+                        "METALCR2.ACT", 0)));
         byte[] pod2 = writer.buildBytes("vector", List.of(
                 new PodArchiveWriter.Blob("A.TXT", new byte[] {1, 2, 3}, null, null,
                         1_700_000_000L)),
                 new PodArchiveWriter.WriteOptions(PodArchive.Format.POD2, null, List.of()));
 
         assertEquals("a909fc89a0f2b8d1bb4c4e28b4288b8440c7bc67bd2a8258d0438dce2f008cb8", sha256(classic));
-        assertEquals("693e615f827790ba6aa6126b2ca27f0fde6ec34d58fdf1edb63b0f4328c609ef", sha256(extended));
+        assertEquals("730fc5da3fed95209929bbb98389b0bfb979df9e88d526cb0630a7669c0562ee", sha256(palette));
         assertEquals("a1679199ed5bb19ba310ae18ea7c0bc6a8c7a55a9244320fb8dbf4cebf5d1c80", sha256(pod2));
         assertEquals(0x0376E6E7L, PodArchiveWriter.crc32Mpeg2("123456789".getBytes(StandardCharsets.US_ASCII)));
     }

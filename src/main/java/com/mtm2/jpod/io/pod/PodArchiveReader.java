@@ -24,10 +24,9 @@ import java.util.List;
  *   <li>Per-entry data bounds check</li>
  * </ul>
  *
- * <p>POD version 1 has no magic value, so the directory layout is detected by
- * validating it. The classic 40-byte record is tried first and the 72-byte
- * POD1-64 record only if the classic table fails to validate, which keeps
- * ordinary archives from being reported as extended.
+ * <p>POD version 1 has no magic value, and its directory record is 40 bytes:
+ * {@code char name[32]}, {@code int32 size}, {@code int32 offset}. That is the
+ * only layout, so a directory table that does not validate as one is refused.
  */
 public final class PodArchiveReader {
 
@@ -37,9 +36,8 @@ public final class PodArchiveReader {
     private static final int POD_COMMENT_SIZE    = 80;
     private static final int POD_ENTRY_NAME_SIZE = 32;
     private static final int POD1_ENTRY_SIZE     = 40;
-    /** POD1-64 widens the directory name field to 64 bytes, giving 72-byte records. */
-    private static final int POD1_64_NAME_SIZE   = 64;
-    private static final int POD1_64_ENTRY_SIZE  = 72;
+    /** Longest name a POD1 directory field can store, the NUL terminator excluded. */
+    public static final int POD1_MAX_NAME_LENGTH = POD_ENTRY_NAME_SIZE - 1;
     private static final int POD2_ENTRY_SIZE     = 20;
     private static final int POD2_AUDIT_SIZE     = 312;
     private static final int EPD_ENTRY_SIZE      = 80;
@@ -86,38 +84,31 @@ public final class PodArchiveReader {
         byte[] commentField = java.util.Arrays.copyOfRange(
                 bytes, Integer.BYTES, Integer.BYTES + POD_COMMENT_SIZE);
 
-        List<PodArchive.Entry> classic =
-                tryReadPod1Directory(bytes, itemCount, POD_ENTRY_NAME_SIZE, POD1_ENTRY_SIZE);
-        if (classic != null) {
-            return new PodArchive(PodArchive.Format.POD1, comment, bytes, classic, commentField);
+        List<PodArchive.Entry> entries = tryReadPod1Directory(bytes, itemCount);
+        if (entries == null) {
+            throw new IOException(
+                    "POD1 directory does not validate as 40-byte entries: " + path);
         }
 
-        List<PodArchive.Entry> extended =
-                tryReadPod1Directory(bytes, itemCount, POD1_64_NAME_SIZE, POD1_64_ENTRY_SIZE);
-        if (extended != null) {
-            return new PodArchive(PodArchive.Format.POD1_64, comment, bytes, extended, commentField);
-        }
-
-        throw new IOException(
-                "POD1 directory is neither a valid 40-byte nor 72-byte layout: " + path);
+        return new PodArchive(PodArchive.Format.POD1, comment, bytes, entries, commentField);
     }
 
     /**
      * Attempts to read the whole POD1 directory table with one record layout.
      *
-     * <p>The table is accepted only if every record decodes to a plausible
-     * non-empty archive path whose data range lies inside the file, which is
-     * what lets the classic and POD1-64 layouts be told apart without a magic
-     * value.
+     * <p>The checks mirror what the engine's own {@code validatePodFile} enforces,
+     * plus NUL-termination: every record must decode to a NUL-terminated, plausible,
+     * non-empty archive path, and its size and offset must be non-negative and name
+     * a range inside the file. Reading them signed matters, because the engine does,
+     * so a negative size is a rejected volume rather than a 2 GB one.
      *
      * @param bytes     complete archive contents
      * @param itemCount directory entry count from the header
-     * @param nameSize  width of the name field, 32 (classic) or 64 (POD1-64)
-     * @param entrySize width of a whole record, 40 (classic) or 72 (POD1-64)
-     * @return the parsed entries, or {@code null} if this layout does not validate
+     * @return the parsed entries, or {@code null} if the directory does not validate
      */
-    private static List<PodArchive.Entry> tryReadPod1Directory(
-            byte[] bytes, int itemCount, int nameSize, int entrySize) {
+    private static List<PodArchive.Entry> tryReadPod1Directory(byte[] bytes, int itemCount) {
+        int nameSize = POD_ENTRY_NAME_SIZE;
+        int entrySize = POD1_ENTRY_SIZE;
         long tableSize = (long) itemCount * entrySize;
         if (POD1_HEADER_SIZE + tableSize > bytes.length) {
             return null;
@@ -128,10 +119,10 @@ public final class PodArchiveReader {
         for (int i = 0; i < itemCount; i++) {
             int entryOffset = POD1_HEADER_SIZE + i * entrySize;
             String name   = decodeNullTerminated(bytes, entryOffset, nameSize);
-            long   length = Integer.toUnsignedLong(readInt32LE(bytes, entryOffset + nameSize));
-            long   offset = Integer.toUnsignedLong(
-                    readInt32LE(bytes, entryOffset + nameSize + Integer.BYTES));
-            if (!isPlausibleArchivePath(name) || offset < dataFloor
+            long   length = readInt32LE(bytes, entryOffset + nameSize);
+            long   offset = readInt32LE(bytes, entryOffset + nameSize + Integer.BYTES);
+            if (!isNulTerminated(bytes, entryOffset, nameSize)
+                    || !isPlausibleArchivePath(name) || offset < dataFloor
                     || !isInBounds(offset, length, bytes.length)) {
                 return null;
             }
@@ -142,13 +133,23 @@ public final class PodArchiveReader {
         return entries;
     }
 
+    /** Returns {@code true} if the name field holds a terminator inside its width. */
+    private static boolean isNulTerminated(byte[] bytes, int fieldOffset, int nameSize) {
+        for (int i = fieldOffset; i < fieldOffset + nameSize; i++) {
+            if (bytes[i] == 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /**
      * Returns {@code true} if {@code name} looks like a stored archive path:
      * non-empty, free of control characters and drive separators, and short
-     * enough to be null-terminated inside a 64-byte field.
+     * enough to be null-terminated inside a 32-byte field.
      */
     private static boolean isPlausibleArchivePath(String name) {
-        if (name.isEmpty() || name.length() > POD1_64_NAME_SIZE - 1) {
+        if (name.isEmpty() || name.length() > POD1_MAX_NAME_LENGTH) {
             return false;
         }
         for (int i = 0; i < name.length(); i++) {

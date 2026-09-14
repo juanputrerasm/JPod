@@ -69,9 +69,9 @@ public final class PodReportExporter {
             w.newLine();
 
             for (PodArchive.Entry entry : entries) {
-                // Name left-justified, size at col 30, offset at col 45. A POD1-64
-                // name can be wider than its column, in which case the remaining
-                // columns shift right instead of overwriting the name.
+                // Name left-justified, size at col 30, offset at col 45. A name wider
+                // than its column shifts the remaining columns right instead of being
+                // overwritten.
                 StringBuilder line = new StringBuilder(96);
                 line.append(entry.name().replace('\0', ' ').strip());
                 padTo(line, 30);

@@ -708,13 +708,6 @@ public final class MainWindow extends JFrame {
                     progressLabel.setText("Saved: " + target.getFileName()
                             + " (" + written.displayName() + ")");
                     setTitle(TITLE + " - " + target.getFileName());
-                    if (written == PodArchive.Format.POD1_64 && requestedFormat == PodArchive.Format.POD1) {
-                        JOptionPane.showMessageDialog(MainWindow.this,
-                                "This archive contains entry names longer than 31 characters, "
-                                + "so it was written with the 64-byte POD1 directory.\n"
-                                + "Only updated engines and tools can open it.",
-                                TITLE, JOptionPane.INFORMATION_MESSAGE);
-                    }
                 } catch (Exception ex) {
                     showError("Save failed", ex);
                 }
@@ -910,8 +903,8 @@ public final class MainWindow extends JFrame {
     }
 
     private PodArchive.Format chooseOutputFormat() {
-        PodArchive.Format[] formats = {PodArchive.Format.POD1,
-                PodArchive.Format.POD1_64, PodArchive.Format.POD2};
+        // EPD is read-only, so POD1 and POD2 are the writable formats.
+        PodArchive.Format[] formats = {PodArchive.Format.POD1, PodArchive.Format.POD2};
         return (PodArchive.Format) JOptionPane.showInputDialog(this, "Archive format:",
                 "Save Archive As", JOptionPane.PLAIN_MESSAGE, null, formats, outputFormat);
     }
@@ -1265,10 +1258,8 @@ public final class MainWindow extends JFrame {
                     openedArchive = archive;
                     openedWithDuplicateNames = hasDuplicateNames(archive);
                     currentArchivePath = selected;
-                    outputFormat = archive.getFormat() == PodArchive.Format.POD1_64
-                            ? PodArchive.Format.POD1_64
-                            : archive.getFormat() == PodArchive.Format.POD2
-                                    ? PodArchive.Format.POD2 : PodArchive.Format.POD1;
+                    outputFormat = archive.getFormat() == PodArchive.Format.POD2
+                            ? PodArchive.Format.POD2 : PodArchive.Format.POD1;
                     auditEntries.clear();
                     auditEntries.addAll(archive.getAuditEntries());
                     explicitFolderPaths.clear();
