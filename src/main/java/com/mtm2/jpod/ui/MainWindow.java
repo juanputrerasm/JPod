@@ -10,17 +10,21 @@ import com.mtm2.jpod.io.pod.PodArchive;
 import com.mtm2.jpod.io.pod.PodArchiveReader;
 import com.mtm2.jpod.io.pod.PodArchiveWriter;
 import com.mtm2.jpod.io.pod.PodArchiveValidator;
+import com.mtm2.jpod.io.pod.PodDataSource;
+import com.mtm2.jpod.io.pod.PodEntryDescriber;
+import com.mtm2.jpod.io.pod.PodEntryDisabling;
 
 import javax.swing.*;
 import javax.swing.filechooser.FileNameExtensionFilter;
 import javax.swing.table.DefaultTableCellRenderer;
-import javax.swing.table.DefaultTableModel;
 import java.awt.*;
 import java.awt.datatransfer.DataFlavor;
 import java.awt.datatransfer.StringSelection;
 import java.awt.datatransfer.Transferable;
 import java.awt.dnd.*;
+import java.io.BufferedOutputStream;
 import java.io.File;
+import java.io.OutputStream;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -82,11 +86,27 @@ public final class MainWindow extends JFrame {
 
     private final PodSession session = new PodSession();
     private final PodArchiveReader reader = new PodArchiveReader();
-    private AppConfig config = AppConfig.load();
+    /**
+     * Stored preferences, read on first use. Nothing needs them until a menu or a
+     * file chooser opens, so reading them in the constructor only delayed the first
+     * paint.
+     */
+    private AppConfig configCache;
     private JMenu recentFilesMenu;
 
+    /**
+     * What the status bar says when nothing is loaded. The counters are hidden then
+     * rather than shown as zeroes: the projected size of nothing is the 84-byte POD1
+     * header, which is arithmetic rather than information.
+     */
+    private static final String EMPTY_STATE_HINT =
+            "No archive open. Open a POD file, or drag files in to start a new one.";
+
+    private final Timer selectionCountTimer = new Timer(50, e -> updateSelectedCount());
+    private boolean suppressSelectionEvents;
+
     // --- UI components ---
-    private final DefaultTableModel tableModel;
+    private final BrowserTableModel tableModel;
     private final JTable entryTable;
     private final JLabel progressLabel      = new JLabel(" ");
     private final JLabel activityIndicator  = new JLabel("  ");
@@ -111,16 +131,89 @@ public final class MainWindow extends JFrame {
      * One entry in the editor. {@code nameField} is the directory field the entry
      * was read from, carried so a re-save reproduces it byte for byte; it is null
      * for entries added from disk or from a manifest.
+     *
+     * <p>An entry read from an archive references its payload in the archive rather
+     * than holding a copy. Browsing, sorting and filtering need only names and
+     * lengths, so the bytes stay on disk until a preview, an extract or a save asks
+     * for them.
      */
-    private record EditableEntry(String name, byte[] data, byte[] nameField,
-                                 String embeddedPaletteName, long timestamp) {
-        private EditableEntry(String name, byte[] data) {
-            this(name, data, null, null, Instant.now().getEpochSecond());
-        }
+    private static final class EditableEntry {
+        private final String name;
+        private final byte[] bytes;
+        private final PodDataSource source;
+        private final long offset;
+        private final int length;
+        private final byte[] nameField;
+        private final String embeddedPaletteName;
+        private final long timestamp;
+
+        /** An entry whose bytes are held in memory: added from disk or a manifest. */
         private EditableEntry(String name, byte[] data, byte[] nameField,
-                String embeddedPaletteName) {
-            this(name, data, nameField, embeddedPaletteName, Instant.now().getEpochSecond());
+                String embeddedPaletteName, long timestamp) {
+            this(name, data, null, 0, data.length, nameField, embeddedPaletteName, timestamp);
         }
+
+        private EditableEntry(String name, byte[] bytes, PodDataSource source, long offset,
+                int length, byte[] nameField, String embeddedPaletteName, long timestamp) {
+            this.name = name;
+            this.bytes = bytes;
+            this.source = source;
+            this.offset = offset;
+            this.length = length;
+            this.nameField = nameField;
+            this.embeddedPaletteName = embeddedPaletteName;
+            this.timestamp = timestamp;
+        }
+
+        /** An entry that reads its payload from an open archive when asked. */
+        private static EditableEntry fromArchive(PodArchive archive, PodArchive.Entry entry) {
+            return new EditableEntry(entry.name(), null, archive.getData(), entry.offset(),
+                    Math.toIntExact(entry.length()), entry.nameField(), entry.embeddedPaletteName(),
+                    entry.timestamp());
+        }
+
+        String name() { return name; }
+
+        int length() { return length; }
+
+        byte[] nameField() { return nameField; }
+
+        String embeddedPaletteName() { return embeddedPaletteName; }
+
+        long timestamp() { return timestamp; }
+
+        /** The payload as one array, read from the archive if it is not held. */
+        byte[] data() {
+            return bytes != null ? bytes : source.readExact(offset, length);
+        }
+
+        EditableEntry withName(String newName) {
+            return new EditableEntry(newName, bytes, source, offset, length, nameField,
+                    embeddedPaletteName, timestamp);
+        }
+
+        /** Streams the payload without holding it in memory. */
+        void copyTo(OutputStream target, byte[] scratch) throws IOException {
+            if (bytes != null) {
+                target.write(bytes);
+            } else {
+                source.copyTo(offset, length, target, scratch);
+            }
+        }
+
+        PodArchiveWriter.Blob toBlob() {
+            return bytes != null
+                    ? new PodArchiveWriter.Blob(name, bytes, nameField, embeddedPaletteName, timestamp)
+                    : new PodArchiveWriter.Blob(name, source, offset, length, nameField,
+                            embeddedPaletteName, timestamp);
+        }
+    }
+
+    private AppConfig config() {
+        if (configCache == null) {
+            configCache = AppConfig.load();
+        }
+        return configCache;
     }
 
     // -------------------------------------------------------------------------
@@ -129,21 +222,34 @@ public final class MainWindow extends JFrame {
 
     public MainWindow() {
         super(TITLE);
-        setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
-        setSize(760, 560);
+        // Closing asks first when there are unsaved changes, and releases the archive.
+        setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE);
+        addWindowListener(new java.awt.event.WindowAdapter() {
+            @Override public void windowClosing(java.awt.event.WindowEvent e) {
+                requestClose();
+            }
+        });
+        setSize(860, 600);
         setLocationRelativeTo(null);
 
-        tableModel = new DefaultTableModel(new String[]{"Name", "Size", "Description"}, 0) {
-            @Override public boolean isCellEditable(int r, int c) { return false; }
-        };
+        tableModel = new BrowserTableModel();
         entryTable = new JTable(tableModel);
         entryTable.setSelectionMode(ListSelectionModel.MULTIPLE_INTERVAL_SELECTION);
         entryTable.getColumnModel().getColumn(0).setPreferredWidth(300);
         entryTable.getColumnModel().getColumn(1).setPreferredWidth(100);
         entryTable.getColumnModel().getColumn(2).setPreferredWidth(280);
         entryTable.getColumnModel().getColumn(0).setCellRenderer(new BrowserNameCellRenderer());
+        DefaultTableCellRenderer sizeRenderer = new DefaultTableCellRenderer();
+        sizeRenderer.setHorizontalAlignment(SwingConstants.RIGHT);
+        entryTable.getColumnModel().getColumn(1).setCellRenderer(sizeRenderer);
         entryTable.setRowHeight(Math.max(entryTable.getRowHeight(), 22));
-        entryTable.getSelectionModel().addListSelectionListener(e -> updateSelectedCount());
+        // Dragging or shift-clicking across a large range changes the selection once
+        // per row, and each count re-reads the whole selection, so the changes are
+        // coalesced into one recompute.
+        selectionCountTimer.setRepeats(false);
+        entryTable.getSelectionModel().addListSelectionListener(e -> {
+            if (!suppressSelectionEvents) selectionCountTimer.restart();
+        });
         entryTable.getTableHeader().addMouseListener(new java.awt.event.MouseAdapter() {
             @Override public void mouseClicked(java.awt.event.MouseEvent e) {
                 int column = entryTable.columnAtPoint(e.getPoint());
@@ -222,84 +328,195 @@ public final class MainWindow extends JFrame {
 
         updateColumnHeaders();
         buildMenuBar();
-        refreshRecentFilesMenu();
+        refreshTable();
+        progressLabel.setText(EMPTY_STATE_HINT);
+    }
+
+    /** Opens a POD, EPD or response list given on the command line. */
+    public void openAtStartup(Path path) {
+        String lower = path.getFileName().toString().toLowerCase(Locale.ROOT);
+        if (lower.endsWith(".lst") || lower.endsWith(".rsp")) {
+            openManifestPath(path);
+        } else {
+            openPodPath(path);
+        }
+    }
+
+    /** Asks about unsaved changes, then releases the archive and exits. */
+    private void requestClose() {
+        if (!confirmDiscardChanges()) return;
+        // The open archive holds a file handle for as long as it lives.
+        closeOpenedArchive();
+        selectionCountTimer.stop();
+        dispose();
+        System.exit(0);
     }
 
     // -------------------------------------------------------------------------
     // Toolbar / Menu
     // -------------------------------------------------------------------------
 
+    /**
+     * The toolbar: the actions worth a label carry one, the rest are icon-only with a
+     * tooltip, and the ones that come in families sit behind a split button whose
+     * face runs the most common of them. Everything here is also in the menus, so
+     * nothing is reachable only through a dropdown.
+     */
     private JToolBar buildToolBar() {
         JToolBar bar = new JToolBar();
         bar.setFloatable(false);
+        bar.setRollover(true);
 
-        bar.add(toolButton("Open…",           this::onOpen));
-        bar.add(toolButton("Save",            this::onSave));
-        bar.add(toolButton("Save As…",        this::onSaveAs));
+        addSplitButton(bar, "New", "Start a new archive", ToolbarIcons.NEW, this::onNew, () -> List.of(
+                menuItem("New Archive", this::onNew),
+                menuItem("Open Response List File\u2026", this::onOpenManifest)));
+        addSplitButton(bar, "Open", "Open a POD or EPD archive", ToolbarIcons.OPEN, this::onOpen,
+                this::openButtonMenu);
+        bar.add(labelledButton("Save", "Save over the open archive", ToolbarIcons.SAVE, this::onSave));
+        bar.add(labelledButton("Save As", "Write the entry list to a new archive", ToolbarIcons.SAVE_AS,
+                this::onSaveAs));
         bar.addSeparator();
-        bar.add(toolButton("Expand +",        this::expandAllFolders));
-        bar.add(toolButton("Collapse -",      this::collapseAllFolders));
+        addSplitButton(bar, "Add", "Add files to the archive", ToolbarIcons.ADD, this::onAddFiles, () -> List.of(
+                menuItem("Add Files\u2026", this::onAddFiles),
+                menuItem("Add Folder\u2026", this::onAddFolder),
+                menuItem("Create Folder\u2026", this::onCreateFolder)));
+        addSplitButton(bar, "Extract", "Extract the selected entries", ToolbarIcons.EXTRACT,
+                this::onExtractSelected, () -> List.of(
+                        menuItem("Extract Selected\u2026", this::onExtractSelected),
+                        menuItem("Extract All\u2026", this::onExtractAll)));
+        bar.add(iconButton("Remove the selected entries", ToolbarIcons.REMOVE, this::onRemoveSelected));
         bar.addSeparator();
-        bar.add(toolButton("Add Files…",      this::onAddFiles));
-        bar.add(toolButton("Add Folder…",     this::onAddFolder));
-        bar.add(toolButton("Extract Sel.",    this::onExtractSelected));
-        bar.add(toolButton("Extract All",     this::onExtractAll));
-        bar.addSeparator();
-        bar.add(toolButton("Remove",          this::onRemoveSelected));
-        bar.addSeparator();
-        bar.add(toolButton("Search",          this::onSearch));
-        bar.add(toolButton("About",           this::onAbout));
+        bar.add(iconButton("Open every folder", ToolbarIcons.EXPAND,
+                () -> withBusy("Expanding folders\u2026", this::expandAllFolders)));
+        bar.add(iconButton("Close every folder", ToolbarIcons.COLLAPSE,
+                () -> withBusy("Collapsing folders\u2026", this::collapseAllFolders)));
+        bar.add(iconButton("Find entries by name or size", ToolbarIcons.SEARCH, this::onSearch));
+        bar.add(Box.createHorizontalGlue());
+        bar.add(iconButton("About JPod", ToolbarIcons.ABOUT, this::onAbout));
         return bar;
+    }
+
+    /** Open's dropdown: the open commands, then the recent files, built as it opens. */
+    private List<JMenuItem> openButtonMenu() {
+        List<JMenuItem> items = new ArrayList<>();
+        items.add(menuItem("Open POD\u2026", this::onOpen));
+        items.add(menuItem("Open Response List File\u2026", this::onOpenManifest));
+        items.add(null);
+        List<Path> recents = config().recentOpenedFiles();
+        if (recents.isEmpty()) {
+            JMenuItem none = new JMenuItem("(no recent files)");
+            none.setEnabled(false);
+            items.add(none);
+        }
+        for (Path path : recents) {
+            JMenuItem item = menuItem(path.getFileName() != null ? path.getFileName().toString()
+                    : path.toString(), () -> openRecentFile(path));
+            item.setToolTipText(path.toString());
+            items.add(item);
+        }
+        return items;
     }
 
     private void buildMenuBar() {
         JMenuBar mb = new JMenuBar();
 
         JMenu fileMenu = new JMenu("File");
-        fileMenu.add(menuItem("Open POD…",        this::onOpen));
+        fileMenu.add(menuItem("Open POD\u2026",        this::onOpen));
         fileMenu.add(menuItem("New Archive",       this::onNew));
-        fileMenu.add(menuItem("Open Response List File…",   this::onOpenManifest));
+        fileMenu.add(menuItem("Open Response List File\u2026",   this::onOpenManifest));
         recentFilesMenu = new JMenu("Open Recent");
+        // Built as it opens, so the preferences are not read until something needs them.
+        recentFilesMenu.addMenuListener(new javax.swing.event.MenuListener() {
+            @Override public void menuSelected(javax.swing.event.MenuEvent e) { refreshRecentFilesMenu(); }
+            @Override public void menuDeselected(javax.swing.event.MenuEvent e) { }
+            @Override public void menuCanceled(javax.swing.event.MenuEvent e) { }
+        });
         fileMenu.add(recentFilesMenu);
         fileMenu.addSeparator();
-        fileMenu.add(menuItem("Add Files…",        this::onAddFiles));
-        fileMenu.add(menuItem("Add Folder…",       this::onAddFolder));
-        fileMenu.add(menuItem("Create Folder…",    this::onCreateFolder));
+        fileMenu.add(menuItem("Add Files\u2026",        this::onAddFiles));
+        fileMenu.add(menuItem("Add Folder\u2026",       this::onAddFolder));
+        fileMenu.add(menuItem("Create Folder\u2026",    this::onCreateFolder));
         fileMenu.add(menuItem("Remove Selected",   this::onRemoveSelected));
         fileMenu.add(menuItem("Save",              this::onSave));
-        fileMenu.add(menuItem("Save As…",          this::onSaveAs));
+        fileMenu.add(menuItem("Save As\u2026",          this::onSaveAs));
         fileMenu.addSeparator();
-        fileMenu.add(menuItem("Extract All…",      this::onExtractAll));
-        fileMenu.add(menuItem("Extract Selected…", this::onExtractSelected));
+        fileMenu.add(menuItem("Extract All\u2026",      this::onExtractAll));
+        fileMenu.add(menuItem("Extract Selected\u2026", this::onExtractSelected));
         fileMenu.addSeparator();
-        fileMenu.add(menuItem("Save .inf Report…", this::onExportInfo));
-        fileMenu.add(menuItem("Save .lst List…",   this::onExportList));
+        fileMenu.add(menuItem("Save .inf Report\u2026", this::onExportInfo));
+        fileMenu.add(menuItem("Save .lst List\u2026",   this::onExportList));
         fileMenu.addSeparator();
-        fileMenu.add(menuItem("Exit", () -> System.exit(0)));
+        fileMenu.add(menuItem("Exit", this::requestClose));
+
+        JMenu viewMenu = new JMenu("View");
+        viewMenu.add(menuItem("Expand All Folders", () -> withBusy("Expanding folders\u2026", this::expandAllFolders)));
+        viewMenu.add(menuItem("Collapse All Folders", () -> withBusy("Collapsing folders\u2026", this::collapseAllFolders)));
 
         JMenu toolMenu = new JMenu("Tools");
-        toolMenu.add(menuItem("Mount in pod.ini…", this::onMount));
-        toolMenu.add(menuItem("Search…",           this::onSearch));
-        toolMenu.add(menuItem("Validate Archive…", this::onValidate));
+        toolMenu.add(menuItem("Mount in pod.ini\u2026", this::onMount));
+        toolMenu.add(menuItem("Search\u2026",           this::onSearch));
+        toolMenu.add(menuItem("Validate Archive\u2026", this::onValidate));
+        toolMenu.addSeparator();
+        toolMenu.add(menuItem("Disable in Game", () -> applyDisabling(true)));
+        toolMenu.add(menuItem("Enable in Game", () -> applyDisabling(false)));
+        toolMenu.addSeparator();
         JCheckBoxMenuItem auditItem = new JCheckBoxMenuItem("Record POD2 audit history", auditEnabled);
         auditItem.addActionListener(e -> auditEnabled = auditItem.isSelected());
         toolMenu.add(auditItem);
-        toolMenu.add(menuItem("Set Audit Author…", this::onSetAuditAuthor));
-        toolMenu.add(menuItem("View POD2 Audit History…", this::onViewAuditHistory));
+        toolMenu.add(menuItem("Set Audit Author\u2026", this::onSetAuditAuthor));
+        toolMenu.add(menuItem("View POD2 Audit History\u2026", this::onViewAuditHistory));
 
         JMenu helpMenu = new JMenu("Help");
-        helpMenu.add(menuItem("About JPod…", this::onAbout));
+        helpMenu.add(menuItem("About JPod\u2026", this::onAbout));
 
         mb.add(fileMenu);
+        mb.add(viewMenu);
         mb.add(toolMenu);
         mb.add(helpMenu);
         setJMenuBar(mb);
     }
 
-    private static JButton toolButton(String label, Runnable action) {
-        JButton btn = new JButton(label);
-        btn.addActionListener(e -> action.run());
-        return btn;
+    /** A toolbar button showing its icon and its label. */
+    private static JButton labelledButton(String label, String tooltip, Icon icon, Runnable action) {
+        JButton button = new JButton(label, icon);
+        button.setToolTipText(tooltip);
+        button.setFocusable(false);
+        button.addActionListener(e -> action.run());
+        return button;
+    }
+
+    /** A toolbar button showing only its icon; the tooltip says what it does. */
+    private static JButton iconButton(String tooltip, Icon icon, Runnable action) {
+        JButton button = new JButton(icon);
+        button.setToolTipText(tooltip);
+        button.getAccessibleContext().setAccessibleName(tooltip);
+        button.setFocusable(false);
+        button.addActionListener(e -> action.run());
+        return button;
+    }
+
+    /**
+     * A split button: the face runs {@code defaultAction}, the arrow beside it opens the
+     * rest. A {@code null} item in the menu is a separator.
+     */
+    private static void addSplitButton(JToolBar bar, String label, String tooltip, Icon icon,
+            Runnable defaultAction, java.util.function.Supplier<List<JMenuItem>> items) {
+        JButton face = labelledButton(label, tooltip, icon, defaultAction);
+        JButton arrow = new JButton(ToolbarIcons.ARROW);
+        arrow.setToolTipText(label + " options");
+        arrow.getAccessibleContext().setAccessibleName(label + " options");
+        arrow.setFocusable(false);
+        arrow.setMargin(new Insets(arrow.getMargin().top, 1, arrow.getMargin().bottom, 1));
+        arrow.addActionListener(e -> {
+            JPopupMenu menu = new JPopupMenu();
+            for (JMenuItem item : items.get()) {
+                if (item == null) menu.addSeparator();
+                else menu.add(item);
+            }
+            menu.show(face, 0, face.getHeight());
+        });
+        bar.add(face);
+        bar.add(arrow);
     }
 
     private static JMenuItem menuItem(String label, Runnable action) {
@@ -316,12 +533,9 @@ public final class MainWindow extends JFrame {
         JPanel bar = new JPanel(new BorderLayout(4, 0));
         bar.setBorder(BorderFactory.createEmptyBorder(2, 4, 2, 4));
 
-        JPanel left = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
-        left.add(new JLabel("Size:"));
+        JPanel left = new JPanel(new FlowLayout(FlowLayout.LEFT, 10, 0));
         left.add(archiveSizeLabel);
-        left.add(new JLabel("Files:"));
         left.add(archiveCountLabel);
-        left.add(new JLabel("Selected:"));
         left.add(selectedCountLabel);
         left.add(dirtyLabel);
 
@@ -341,6 +555,14 @@ public final class MainWindow extends JFrame {
             entryTable.setRowSelectionInterval(row, row);
         }
         BrowserRow browserRow = row >= 0 && row < displayedRows.size() ? displayedRows.get(row) : null;
+        int[] selection = selectedSourceRows();
+        boolean anyEnabled = false;
+        boolean anyDisabled = false;
+        for (int index : selection) {
+            String name = editableEntries.get(index).name();
+            anyEnabled |= PodEntryDisabling.canDisable(name);
+            anyDisabled |= PodEntryDisabling.canEnable(name);
+        }
         JPopupMenu menu = new JPopupMenu();
         if (browserRow != null && browserRow.folder()) {
             menu.add(menuItem(browserRow.collapsed() ? "Expand" : "Collapse", () -> toggleFolderRow(row)));
@@ -348,6 +570,7 @@ public final class MainWindow extends JFrame {
             menu.add(menuItem("Rename Folder…", () -> onRenameSelected(row)));
             menu.add(menuItem("Move To Folder…", this::onMoveSelected));
             menu.add(menuItem("Remove", this::onRemoveSelected));
+            addDisablingItems(menu, anyEnabled, anyDisabled);
             menu.add(menuItem("Extract Selected", this::onExtractSelected));
         } else {
             menu.add(menuItem("Preview",            this::onPreview));
@@ -356,10 +579,63 @@ public final class MainWindow extends JFrame {
             menu.add(menuItem("Move To Folder…",    this::onMoveSelected));
             menu.add(menuItem("Replace with File…", this::onReplaceEntry));
             menu.add(menuItem("Remove",             this::onRemoveSelected));
+            addDisablingItems(menu, anyEnabled, anyDisabled);
             menu.addSeparator();
             menu.add(menuItem("Extract Selected",   this::onExtractSelected));
         }
         menu.show(e.getComponent(), e.getX(), e.getY());
+    }
+
+    /**
+     * Offers the CommPatch 26 disable and enable renames, but only for a selection that
+     * has something to rename. A pod of art has neither item.
+     */
+    private void addDisablingItems(JPopupMenu menu, boolean anyEnabled, boolean anyDisabled) {
+        if (!anyEnabled && !anyDisabled) return;
+        menu.addSeparator();
+        if (anyEnabled) menu.add(menuItem("Disable in Game", () -> applyDisabling(true)));
+        if (anyDisabled) menu.add(menuItem("Enable in Game", () -> applyDisabling(false)));
+    }
+
+    /**
+     * Renames the selected tracks and trucks between the extensions the game reads and
+     * the ones it passes over. The payload is untouched, so a disabled addon still
+     * costs its space in the pod and comes back byte for byte.
+     */
+    private void applyDisabling(boolean disable) {
+        int[] indices = selectedSourceRows();
+        if (indices.length == 0) {
+            JOptionPane.showMessageDialog(this, "Select the track or truck entries to "
+                    + (disable ? "disable." : "enable."), TITLE, JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+        List<EditableEntry> changed = new ArrayList<>(editableEntries);
+        List<String[]> renamed = new ArrayList<>();
+        for (int index : indices) {
+            EditableEntry entry = changed.get(index);
+            String newName = disable ? PodEntryDisabling.disable(entry.name())
+                    : PodEntryDisabling.enable(entry.name());
+            if (newName == null) continue;
+            changed.set(index, renamedEntry(entry, newName));
+            renamed.add(new String[] {entry.name(), newName, Integer.toString(index)});
+        }
+        if (renamed.isEmpty()) {
+            progressLabel.setText("Nothing in the selection to " + (disable ? "disable." : "enable."));
+            return;
+        }
+        if (!validateEditedEntries(changed)) return;
+        editableEntries.clear();
+        editableEntries.addAll(changed);
+        for (String[] rename : renamed) {
+            addMoveAudit(rename[0], rename[1], editableEntries.get(Integer.parseInt(rename[2])));
+        }
+        markDirty();
+        refreshTable();
+        // Worth saying every time: the rename is invisible in single player, but the
+        // other end of a multiplayer game sees a pod that no longer matches theirs.
+        progressLabel.setText((disable ? "Disabled " : "Enabled ") + renamed.size()
+                + (renamed.size() == 1 ? " entry" : " entries")
+                + ". Changing a track pod's status can trigger the multiplayer Different Version message.");
     }
 
     // -------------------------------------------------------------------------
@@ -385,7 +661,7 @@ public final class MainWindow extends JFrame {
         resetFolderBrowserState();
         archiveComment = "";
         commentField.setText("");
-        openedArchive = null;
+        closeOpenedArchive();
         openedWithDuplicateNames = false;
         currentArchivePath = null;
         outputFormat = PodArchive.Format.POD1;
@@ -395,7 +671,7 @@ public final class MainWindow extends JFrame {
         session.reset();
         refreshTable();
         setTitle(TITLE + " - New Archive");
-        progressLabel.setText("Add files with 'Add Files…' or drag and drop, then 'Save As…'.");
+        progressLabel.setText("New archive. Add files or drag them in, then use Save As.");
     }
 
     /**
@@ -586,7 +862,7 @@ public final class MainWindow extends JFrame {
         for (int i = sourceRows.length - 1; i >= 0; i--) {
             EditableEntry removed = editableEntries.get(sourceRows[i]);
             addAudit(PodArchive.AuditAction.REMOVE, removed.name(), removed.timestamp(),
-                    removed.data().length, 0, 0);
+                    removed.length(), 0, 0);
             editableEntries.remove(sourceRows[i]);
         }
         markDirty();
@@ -624,7 +900,7 @@ public final class MainWindow extends JFrame {
             editableEntries.set(row, new EditableEntry(old.name(), newData, old.nameField(),
                     old.embeddedPaletteName(), now));
             addAudit(PodArchive.AuditAction.CHANGE, old.name(), old.timestamp(),
-                    old.data().length, now, newData.length);
+                    old.length(), now, newData.length);
             markDirty();
             refreshTable();
             selectTableRow(row);
@@ -684,32 +960,61 @@ public final class MainWindow extends JFrame {
         if (answer != JOptionPane.YES_OPTION) return;
 
         PodArchive.Format actual = validation.outputFormat();
-        setBusy(true);
-        new SwingWorker<PodArchive.Format, Void>() {
-            @Override protected PodArchive.Format doInBackground() throws Exception {
-                byte[] rawComment = openedArchive != null && openedArchive.isPod1Family()
-                        ? openedArchive.getCommentField() : null;
-                List<PodArchive.AuditEntry> audits = actual == PodArchive.Format.POD2 && auditEnabled
-                        ? List.copyOf(auditEntries) : List.of();
-                return new PodArchiveWriter().write(target, savedComment, blobs,
-                        new PodArchiveWriter.WriteOptions(actual, rawComment, audits,
-                                openedWithDuplicateNames));
+        setBusy(true, "Saving " + target.getFileName() + "\u2026");
+        // The blobs stream their payloads out of the archive being read, which may be
+        // the very file being written. Its handle is released only once the new archive
+        // is complete beside the target and every payload has been read.
+        PodArchive reading = openedArchive;
+        boolean[] released = {false};
+        byte[] rawComment = openedArchive != null && openedArchive.isPod1Family()
+                ? openedArchive.getCommentField() : null;
+        List<PodArchive.AuditEntry> audits = actual == PodArchive.Format.POD2 && auditEnabled
+                ? List.copyOf(auditEntries) : List.of();
+        boolean allowDuplicates = openedWithDuplicateNames;
+        new SwingWorker<PodArchive, Void>() {
+            @Override protected PodArchive doInBackground() throws Exception {
+                new PodArchiveWriter().write(target, savedComment, blobs,
+                        new PodArchiveWriter.WriteOptions(actual, rawComment, audits, allowDuplicates),
+                        () -> {
+                            released[0] = true;
+                            if (reading != null) reading.close();
+                        });
+                // The entry list referenced the archive that was just replaced, and any
+                // entry added from disk still held its bytes. Reading back what is now
+                // on disk fixes both, and costs one directory read.
+                return reader.read(target);
             }
             @Override protected void done() {
-                setBusy(false);
+                setBusy(false, null);
                 try {
-                    PodArchive.Format written = get();
+                    PodArchive written = get();
+                    rebindTo(target, written);
                     dirty = false;
                     currentArchivePath = target;
-                    outputFormat = written;
+                    outputFormat = written.getFormat();
                     updateDirtyLabel();
                     session.setTargetFolderPath(target.getParent());
                     session.setTargetFileName(target.getFileName().toString());
                     progressLabel.setText("Saved: " + target.getFileName()
-                            + " (" + written.displayName() + ")");
+                            + " (" + written.getFormat().displayName() + ")");
                     setTitle(TITLE + " - " + target.getFileName());
                 } catch (Exception ex) {
                     showError("Save failed", ex);
+                    // The source handle was already released, so the entries point at
+                    // bytes that are no longer reachable. Leaving them on display would
+                    // fail on the next preview or extract.
+                    if (released[0]) {
+                        openedArchive = null;
+                        session.setOpenArchive(null);
+                        editableEntries.clear();
+                        resetFolderBrowserState();
+                        commentField.setText("");
+                        archiveComment = "";
+                        currentArchivePath = null;
+                        dirty = false;
+                        refreshTable();
+                        progressLabel.setText("Save failed and the open archive was closed. Reopen it to continue.");
+                    }
                 }
             }
         }.execute();
@@ -748,9 +1053,12 @@ public final class MainWindow extends JFrame {
         int total = toExtract.size();
         boolean preserveFolders = session.isPreserveExtractFolderStructure();
 
-        setBusy(true);
+        setBusy(true, "Extracting " + total + (total == 1 ? " entry\u2026" : " entries\u2026"));
         new SwingWorker<Void, Integer>() {
             @Override protected Void doInBackground() throws Exception {
+                // Streamed through one buffer rather than materialized: extracting a
+                // whole archive should not need the whole archive in memory.
+                byte[] scratch = PodDataSource.newScratch();
                 for (int i = 0; i < toExtract.size(); i++) {
                     publish(i + 1);
                     EditableEntry e = toExtract.get(i);
@@ -758,7 +1066,10 @@ public final class MainWindow extends JFrame {
                     if (dest.getParent() != null) {
                         Files.createDirectories(dest.getParent());
                     }
-                    Files.write(dest, e.data());
+                    try (OutputStream out = new BufferedOutputStream(Files.newOutputStream(dest),
+                            PodDataSource.SCRATCH_SIZE)) {
+                        e.copyTo(out, scratch);
+                    }
                 }
                 return null;
             }
@@ -766,8 +1077,7 @@ public final class MainWindow extends JFrame {
                 progressLabel.setText("Extracting " + chunks.get(chunks.size() - 1) + " of " + total + "…");
             }
             @Override protected void done() {
-                setBusy(false);
-                progressLabel.setText("Extraction complete.");
+                setBusy(false, "Extraction complete.");
                 try { get(); } catch (Exception ex) { showError("Extraction failed", ex); }
             }
         }.execute();
@@ -856,7 +1166,7 @@ public final class MainWindow extends JFrame {
         // Build synthetic PodArchive.Entry list from editableEntries for SearchDialog
         List<PodArchive.Entry> synth = new ArrayList<>(editableEntries.size());
         for (EditableEntry e : editableEntries) {
-            synth.add(new PodArchive.Entry(e.name(), e.data().length, 0));
+            synth.add(new PodArchive.Entry(e.name(), e.length(), 0));
         }
         new SearchDialog(this, synth, this::selectTableRow).setVisible(true);
     }
@@ -1005,7 +1315,7 @@ public final class MainWindow extends JFrame {
                     if (answer != JOptionPane.YES_OPTION) continue;
                     EditableEntry old = editableEntries.set(existing, addedEntry);
                     addAudit(PodArchive.AuditAction.CHANGE, name, old.timestamp(),
-                            old.data().length, timestamp, data.length);
+                            old.length(), timestamp, data.length);
                 } else {
                     editableEntries.add(addedEntry);
                     addAudit(PodArchive.AuditAction.ADD, name, 0, 0, timestamp, data.length);
@@ -1034,89 +1344,46 @@ public final class MainWindow extends JFrame {
      * header = 4 + 80 + N × 40 bytes, entries follow sequentially.
      */
     private void refreshTable() {
-        int[] selectedSourceRows = selectedSourceRows();
-        tableModel.setRowCount(0);
+        refreshTable(true);
+    }
+
+    /**
+     * @param preserveSelection false when the caller sets the selection itself straight
+     *        afterwards. Expanding a folder is the case that matters: its heading stands
+     *        for every entry under it, so restoring that selection would re-select a
+     *        thousand rows only to replace them.
+     */
+    private void refreshTable(boolean preserveSelection) {
+        int[] selectedSourceRows = preserveSelection ? selectedSourceRows() : new int[0];
         displayedRows.clear();
+        displayedRows.addAll(buildDisplayedRows());
+        suppressSelectionEvents = true;
+        try {
+            tableModel.fireTableDataChanged();
+            restoreSelection(selectedSourceRows);
+        } finally {
+            suppressSelectionEvents = false;
+        }
         long offset = POD_ITEM_COUNT_BYTES + POD_COMMENT_BYTES
                 + (long) editableEntries.size() * POD_ENTRY_BYTES;
-        displayedRows.addAll(buildDisplayedRows());
-        for (BrowserRow row : displayedRows) {
-            tableModel.addRow(new Object[]{row.nameText(), row.sizeText(), row.description()});
-        }
         for (EditableEntry e : editableEntries) {
-            offset += e.data().length;
+            offset += e.length();
         }
-        archiveCountLabel.setText(String.valueOf(editableEntries.size()));
-        archiveSizeLabel.setText(String.format("%,d", offset));
-        restoreSelection(selectedSourceRows);
+        boolean empty = editableEntries.isEmpty();
+        archiveCountLabel.setText(empty ? "" : "Files: " + editableEntries.size());
+        archiveSizeLabel.setText(empty ? "" : String.format("Size: %,d", offset));
+        selectionCountTimer.stop();
         updateSelectedCount();
         updateDirtyLabel();
     }
 
     private String describeEntry(EditableEntry entry) {
-        String name = entry.name();
-        int dot = name.lastIndexOf('.');
-        String ext = dot >= 0 ? name.substring(dot + 1).toLowerCase(Locale.ROOT) : "";
-        return switch (ext) {
-            case "act" -> "Palette file";
-            case "ani" -> "Animation file";
-            case "bin" -> "3D model file";
-            case "bmp" -> "Bitmap image";
-            case "cl0", "cl1", "cl2", "cl3", "cl4", "cl5" -> "Ground-box collision layer";
-            case "clr" -> "Terrain color layer";
-            case "crs" -> "LVL auxiliary resource";
-            case "def" -> "Object placement definition";
-            case "dmo" -> "Demo manifest";
-            case "gif" -> "GIF image";
-            case "glt" -> "Ground/resource file";
-            case "jpeg", "jpg" -> "JPEG image";
-            case "json" -> "JSON data";
-            case "klp" -> "Music metadata";
-            case "lte" -> "Extended terrain layer";
-            case "lvl" -> "Level manifest";
-            case "lwo" -> "LightWave object file";
-            case "map" -> "Fog map";
-            case "mic" -> "TV/F3 Intro text";
-            case "mix", "mod" -> "Music data";
-            case "pit" -> "CPR Pits file";
-            case "png" -> "PNG image";
-            case "pod" -> "POD archive";
-            case "ra0", "ra1", "ra2" , "ra3" , "ra4", "ra5" -> "Ground-box layer";
-            case "raw" -> rawDescription(entry.data());
-            case "sit" -> "Track file";
-            case "smk" -> "Smacker video";
-            case "tex" -> "Texture manifest";
-            case "tnl" -> "Tunnel definition file";
-            case "trk" -> isDataSubfolderEntry(name) ? "CPR track definition file" : "Truck definition file";
-            case "trn" -> "Tournament definition file";
-            case "ttx" -> "CPR Race-track texture table";
-            case "txx" -> "Traxx track file";
-            case "txp" -> "Texture pattern library";
-            case "txt" -> "Text file";
-            case "tty" -> "Texture metadata";
-            case "tvi" -> "Video file";
-            case "wav" -> "Wave audio file";
-            case "webp" -> "WebP image";
-            case "lst" -> "Response list file";
-            case "inf" -> "Info report";
-            case "ini", "cfg" -> "Configuration file";
-            default -> ext.isBlank() ? "Binary data" : ext.toUpperCase(Locale.ROOT) + " file";
-        };
-    }
-
-    private String rawDescription(byte[] data) {
-        int[] dims = RawImageDecoder.detectDimensions(data.length);
-        if (dims == null) {
-            return "RAW image data (non-standard size)";
-        }
-        if ((dims[0] == 64 && dims[1] == 64) || (dims[0] == 256 && dims[1] == 256)) {
-            return "RAW image data";
-        }
-        return "RAW image data (non-standard " + dims[0] + "x" + dims[1] + ")";
+        return PodEntryDescriber.describe(entry.name(), entry.length());
     }
 
     private void updateSelectedCount() {
-        selectedCountLabel.setText(String.valueOf(selectedSourceRows().length));
+        selectedCountLabel.setText(editableEntries.isEmpty() ? ""
+                : "Selected: " + selectedSourceRows().length);
     }
 
     private void markDirty() {
@@ -1132,8 +1399,77 @@ public final class MainWindow extends JFrame {
     // Helpers
     // -------------------------------------------------------------------------
 
-    private void setBusy(boolean busy) {
+    /**
+     * Turns the activity light red, shows the wait cursor, and says what is running.
+     *
+     * @param message what to show while busy; null leaves the status text alone,
+     *                which is what a finishing call wants so its result is not
+     *                overwritten
+     */
+    private void setBusy(boolean busy, String message) {
         activityIndicator.setBackground(busy ? COLOR_BUSY : COLOR_IDLE);
+        activityIndicator.setToolTipText(busy ? "Working" : "Idle");
+        setCursor(busy ? Cursor.getPredefinedCursor(Cursor.WAIT_CURSOR) : Cursor.getDefaultCursor());
+        if (message != null) {
+            progressLabel.setText(message);
+            // Paint now: otherwise the status bar only repaints once the operation lets
+            // go of the event thread, which is exactly when the message stops mattering.
+            progressLabel.paintImmediately(progressLabel.getVisibleRect());
+            activityIndicator.paintImmediately(activityIndicator.getVisibleRect());
+        }
+    }
+
+    /** Runs a synchronous view change with the activity light on. */
+    private void withBusy(String message, Runnable action) {
+        setBusy(true, message);
+        try {
+            action.run();
+        } finally {
+            setBusy(false, " ");
+        }
+    }
+
+    /**
+     * Fills the entry list from an open archive, referencing its payloads rather than
+     * copying them.
+     */
+    private void loadEntriesFrom(PodArchive archive) {
+        for (PodArchive.Entry entry : archive.getEntries()) {
+            editableEntries.add(EditableEntry.fromArchive(archive, entry));
+        }
+    }
+
+    /**
+     * Releases the open archive's file handle. The entry list references that archive's
+     * bytes, so nothing may read an entry's payload after this until the list is
+     * rebuilt.
+     */
+    private void closeOpenedArchive() {
+        if (openedArchive != null) {
+            openedArchive.close();
+        }
+        openedArchive = null;
+        session.setOpenArchive(null);
+    }
+
+    /**
+     * Points the entry list at the archive just written, dropping whatever it
+     * referenced before. The collapse state and the selection belong to the view and
+     * survive.
+     */
+    private void rebindTo(Path path, PodArchive archive) {
+        closeOpenedArchive();
+        openedArchive = archive;
+        session.setOpenArchive(archive);
+        openedWithDuplicateNames = hasDuplicateNames(archive);
+        session.setSourceFolderPath(path.getParent());
+        session.setSourceFileName(path.getFileName().toString());
+        session.setArchiveByteSize(archive.getData().length());
+        archiveComment = archive.getComment();
+        session.setArchiveComment(archiveComment);
+        editableEntries.clear();
+        loadEntriesFrom(archive);
+        refreshTable();
     }
 
     private void showNoArchive() {
@@ -1149,8 +1485,7 @@ public final class MainWindow extends JFrame {
     private List<PodArchiveWriter.Blob> toBlobs(List<EditableEntry> entries) {
         List<PodArchiveWriter.Blob> blobs = new ArrayList<>(entries.size());
         for (EditableEntry e : entries) {
-            blobs.add(new PodArchiveWriter.Blob(e.name(), e.data(), e.nameField(),
-                    e.embeddedPaletteName(), e.timestamp()));
+            blobs.add(e.toBlob());
         }
         return blobs;
     }
@@ -1163,8 +1498,9 @@ public final class MainWindow extends JFrame {
     }
 
     private EditableEntry renamedEntry(EditableEntry entry, String newName) {
-        return new EditableEntry(PodArchiveWriter.normalizeName(newName), entry.data(),
-                entry.nameField(), entry.embeddedPaletteName(), entry.timestamp());
+        // Keeps the payload where it is, so renaming in a large archive costs nothing
+        // beyond the name.
+        return entry.withName(PodArchiveWriter.normalizeName(newName));
     }
 
     private boolean validateEditedEntries(List<EditableEntry> entries) {
@@ -1186,9 +1522,9 @@ public final class MainWindow extends JFrame {
 
     private void addMoveAudit(String oldName, String newName, EditableEntry entry) {
         addAudit(PodArchive.AuditAction.REMOVE, oldName, entry.timestamp(),
-                entry.data().length, 0, 0);
+                entry.length(), 0, 0);
         addAudit(PodArchive.AuditAction.ADD, newName, 0, 0,
-                entry.timestamp(), entry.data().length);
+                entry.timestamp(), entry.length());
     }
 
     private void addAudit(PodArchive.AuditAction action, String path,
@@ -1246,15 +1582,16 @@ public final class MainWindow extends JFrame {
         session.setSourceFolderPath(selected.getParent());
         session.setSourceFileName(selected.getFileName().toString());
 
-        setBusy(true);
+        setBusy(true, "Opening " + selected.getFileName() + "\u2026");
         new SwingWorker<PodArchive, Void>() {
             @Override protected PodArchive doInBackground() throws Exception {
                 return reader.read(selected);
             }
             @Override protected void done() {
-                setBusy(false);
+                setBusy(false, null);
                 try {
                     PodArchive archive = get();
+                    closeOpenedArchive();
                     openedArchive = archive;
                     openedWithDuplicateNames = hasDuplicateNames(archive);
                     currentArchivePath = selected;
@@ -1269,14 +1606,15 @@ public final class MainWindow extends JFrame {
                     commentField.setText(archiveComment);
                     editableEntries.clear();
                     resetFolderBrowserState();
-                    for (PodArchive.Entry entry : archive.getEntries()) {
-                        editableEntries.add(new EditableEntry(entry.name(), archive.getEntryBytes(entry),
-                                entry.nameField(), entry.embeddedPaletteName(), entry.timestamp()));
-                    }
+                    loadEntriesFrom(archive);
+                    session.setArchiveByteSize(archive.getData().length());
                     dirty = false;
                     refreshTable();
                     rememberOpenedFile(selected);
                     setTitle(TITLE + " - " + selected.getFileName()  + " (" + archive.getFormat().displayName() + ")");
+                    progressLabel.setText("Opened " + selected.getFileName() + ": "
+                            + archive.getEntries().size() + " entries, "
+                            + archive.getFormat().displayName() + ".");
                 } catch (Exception ex) {
                     showError("Failed to open archive", ex);
                 }
@@ -1287,13 +1625,13 @@ public final class MainWindow extends JFrame {
     private void openManifestPath(Path manifestPath) {
         Path sourceFolder = manifestPath.getParent();
 
-        setBusy(true);
+        setBusy(true, "Reading " + manifestPath.getFileName() + "\u2026");
         new SwingWorker<PodManifestParser.Manifest, Void>() {
             @Override protected PodManifestParser.Manifest doInBackground() throws Exception {
                 return new PodManifestParser().parseManifest(manifestPath, sourceFolder);
             }
             @Override protected void done() {
-                setBusy(false);
+                setBusy(false, null);
                 try {
                     PodManifestParser.Manifest manifest = get();
                     List<PodArchiveWriter.Blob> blobs = manifest.blobs();
@@ -1305,7 +1643,7 @@ public final class MainWindow extends JFrame {
                     }
                     archiveComment = manifest.volumeName();
                     commentField.setText(archiveComment);
-                    openedArchive = null;
+                    closeOpenedArchive();
                     currentArchivePath = null;
                     outputFormat = PodArchive.Format.POD1;
                     auditEntries.clear();
@@ -1329,7 +1667,7 @@ public final class MainWindow extends JFrame {
             return;
         }
         recentFilesMenu.removeAll();
-        List<Path> recents = config.recentOpenedFiles();
+        List<Path> recents = config().recentOpenedFiles();
         if (recents.isEmpty()) {
             JMenuItem none = new JMenuItem("(none)");
             none.setEnabled(false);
@@ -1351,7 +1689,7 @@ public final class MainWindow extends JFrame {
                     "File no longer exists:\n" + path,
                     TITLE,
                     JOptionPane.WARNING_MESSAGE);
-            config = config.withoutRecentOpenedFile(path);
+            configCache = config().withoutRecentOpenedFile(path);
             saveConfigQuietly();
             refreshRecentFilesMenu();
             return;
@@ -1360,11 +1698,11 @@ public final class MainWindow extends JFrame {
             return;
         }
         String lower = path.getFileName().toString().toLowerCase(Locale.ROOT);
-        if (lower.endsWith(".pod")) {
+        if (lower.endsWith(".pod") || lower.endsWith(".epd")) {
             openPodPath(path);
             return;
         }
-        if (lower.endsWith(".lst")) {
+        if (lower.endsWith(".lst") || lower.endsWith(".rsp")) {
             openManifestPath(path);
             return;
         }
@@ -1373,20 +1711,20 @@ public final class MainWindow extends JFrame {
                 "Recent file type is not supported anymore:\n" + path,
                 TITLE,
                 JOptionPane.WARNING_MESSAGE);
-        config = config.withoutRecentOpenedFile(path);
+        configCache = config().withoutRecentOpenedFile(path);
         saveConfigQuietly();
         refreshRecentFilesMenu();
     }
 
     private void rememberOpenedFile(Path path) {
-        config = config.withRecentOpenedFile(path);
+        configCache = config().withRecentOpenedFile(path);
         saveConfigQuietly();
         refreshRecentFilesMenu();
     }
 
     private void saveConfigQuietly() {
         try {
-            config.save();
+            config().save();
         } catch (IOException ex) {
             progressLabel.setText("Could not save recent files config.");
         }
@@ -1396,8 +1734,8 @@ public final class MainWindow extends JFrame {
         Path base = null;
         if (session.getSourceFolderPath() != null && Files.isDirectory(session.getSourceFolderPath())) {
             base = session.getSourceFolderPath();
-        } else if (!config.recentOpenedFiles().isEmpty()) {
-            Path recent = config.recentOpenedFiles().get(0);
+        } else if (!config().recentOpenedFiles().isEmpty()) {
+            Path recent = config().recentOpenedFiles().get(0);
             Path parent = Files.isDirectory(recent) ? recent : recent.getParent();
             if (parent != null && Files.isDirectory(parent)) {
                 base = parent;
@@ -1439,32 +1777,31 @@ public final class MainWindow extends JFrame {
 
     private void restoreSelection(int[] sourceRows) {
         entryTable.clearSelection();
+        if (sourceRows.length == 0) return;
+        // One pass to index the view, rather than a scan of it per selected entry.
+        int[] viewRowOf = new int[editableEntries.size()];
+        java.util.Arrays.fill(viewRowOf, -1);
+        for (int displayedRow = 0; displayedRow < displayedRows.size(); displayedRow++) {
+            BrowserRow row = displayedRows.get(displayedRow);
+            if (!row.folder() && row.sourceIndex() < viewRowOf.length) {
+                viewRowOf[row.sourceIndex()] = displayedRow;
+            }
+        }
+        ListSelectionModel selection = entryTable.getSelectionModel();
+        selection.setValueIsAdjusting(true);
         for (int sourceRow : sourceRows) {
-            for (int displayedRow = 0; displayedRow < displayedRows.size(); displayedRow++) {
-                BrowserRow row = displayedRows.get(displayedRow);
-                if (!row.folder() && row.sourceIndex() == sourceRow) {
-                    entryTable.addRowSelectionInterval(displayedRow, displayedRow);
-                    break;
-                }
+            int displayedRow = sourceRow < viewRowOf.length ? viewRowOf[sourceRow] : -1;
+            if (displayedRow >= 0) {
+                selection.addSelectionInterval(displayedRow, displayedRow);
             }
         }
-    }
-
-    private boolean isDataSubfolderEntry(String entryName) {
-        String normalized = entryName.replace('\\', '/').toUpperCase(Locale.ROOT);
-        String[] parts = normalized.split("/");
-        for (int i = 0; i < parts.length - 1; i++) {
-            if ("DATA".equals(parts[i])) {
-                return true;
-            }
-        }
-        return false;
+        selection.setValueIsAdjusting(false);
     }
 
     private Comparator<Integer> comparatorForColumn(int column) {
         return switch (column) {
             case 0 -> Comparator.comparing(i -> editableEntries.get(i).name().toLowerCase(Locale.ROOT));
-            case 1 -> Comparator.comparingInt(i -> editableEntries.get(i).data().length);
+            case 1 -> Comparator.comparingInt(i -> editableEntries.get(i).length());
             case 2 -> Comparator.comparing(i -> describeEntry(editableEntries.get(i)).toLowerCase(Locale.ROOT));
             default -> null;
         };
@@ -1525,7 +1862,7 @@ public final class MainWindow extends JFrame {
         } else {
             collapsedFolderPaths.add(browserRow.folderPath());
         }
-        refreshTable();
+        refreshTable(false);
         if (row < entryTable.getRowCount()) {
             entryTable.setRowSelectionInterval(row, row);
         }
@@ -1592,7 +1929,7 @@ public final class MainWindow extends JFrame {
                         sourceIndex,
                         item.fileName,
                         depth,
-                        entry.data().length,
+                        entry.length(),
                         describeEntry(entry)));
             }
         }
@@ -1763,6 +2100,24 @@ public final class MainWindow extends JFrame {
         }
     }
 
+    /** The table reads straight from {@link #displayedRows}; no copy per refresh. */
+    private final class BrowserTableModel extends javax.swing.table.AbstractTableModel {
+        @Override public int getRowCount() { return displayedRows.size(); }
+
+        @Override public int getColumnCount() { return baseColumnNames.length; }
+
+        @Override public String getColumnName(int column) { return baseColumnNames[column]; }
+
+        @Override public Object getValueAt(int rowIndex, int columnIndex) {
+            BrowserRow row = displayedRows.get(rowIndex);
+            return switch (columnIndex) {
+                case 0 -> row.nameText();
+                case 1 -> row.sizeText();
+                default -> row.description();
+            };
+        }
+    }
+
     private final class BrowserNameCellRenderer extends DefaultTableCellRenderer {
         @Override
         public Component getTableCellRendererComponent(
@@ -1868,7 +2223,7 @@ public final class MainWindow extends JFrame {
         }
 
         private long sortSize() {
-            return folder != null ? 0L : editableEntries.get(fileIndex).data().length;
+            return folder != null ? 0L : editableEntries.get(fileIndex).length();
         }
 
         private String sortDescription() {

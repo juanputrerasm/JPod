@@ -1,10 +1,15 @@
 package com.mtm2.jpod.io.pod;
 
+import java.io.IOException;
+import java.io.OutputStream;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.function.Function;
 
 /**
  * Immutable in-memory representation of a Terminal Reality POD archive.
@@ -15,21 +20,23 @@ import java.util.Optional;
  *   ------   ----   -----------
  *        0      4   Item count (int32)
  *        4     80   Archive comment (null-terminated ISO-8859-1 string)
- *       84  N × 40  Directory table — one {@link Entry} per item:
+ *       84  N x 40  Directory table, one {@link Entry} per item:
  *                     +  0  32 bytes  Entry name (null-padded)
  *                     + 32   4 bytes  Data length (uint32)
  *                     + 36   4 bytes  Data offset from file start (uint32)
- *   84+N×40   …    Raw file data, concatenated in directory order
+ *   84+Nx40  ...    Raw file data, concatenated in directory order
  * </pre>
  *
  * <p>That 40-byte record is the only POD1 directory layout. A directory table
  * that does not validate as one is a malformed archive and is refused.
  *
- * <p>Instances are created exclusively by {@link PodArchiveReader}. The raw
- * file bytes are kept in memory so that individual entry data can be sliced
- * out cheaply via {@link #getEntryBytes(Entry)}.
+ * <p>Instances are created exclusively by {@link PodArchiveReader}. Only the
+ * header and directory are held in memory; payloads stay in the
+ * {@link PodDataSource} until {@link #getEntryBytes(Entry)} or
+ * {@link #copyEntryTo} asks for them. An archive read from disk keeps its file
+ * open, so close it when done.
  */
-public final class PodArchive {
+public final class PodArchive implements AutoCloseable {
 
     public enum Format {
         /** Classic POD version 1: 84-byte header, 40-byte directory records, 31-byte names. */
@@ -52,25 +59,34 @@ public final class PodArchive {
 
     private final Format format;
     private final String comment;
-    private final byte[] bytes;
+    private final PodDataSource data;
     private final List<Entry> entries;
     private final byte[] commentField;
     private final long checksum;
     private final List<AuditEntry> auditEntries;
 
-    PodArchive(Format format, String comment, byte[] bytes, List<Entry> entries) {
-        this(format, comment, bytes, entries, null);
+    /**
+     * Name lookups, built on first use. An archive with thousands of entries is
+     * searched repeatedly while previewing art and models, and a linear scan there
+     * costs a title computation per entry per lookup.
+     */
+    private volatile Map<String, Entry> byName;
+    private volatile Map<String, Entry> byTitle;
+
+    PodArchive(Format format, String comment, PodDataSource data, List<Entry> entries) {
+        this(format, comment, data, entries, null);
     }
 
-    PodArchive(Format format, String comment, byte[] bytes, List<Entry> entries, byte[] commentField) {
-        this(format, comment, bytes, entries, commentField, 0, List.of());
+    PodArchive(Format format, String comment, PodDataSource data, List<Entry> entries,
+            byte[] commentField) {
+        this(format, comment, data, entries, commentField, 0, List.of());
     }
 
-    PodArchive(Format format, String comment, byte[] bytes, List<Entry> entries,
+    PodArchive(Format format, String comment, PodDataSource data, List<Entry> entries,
             byte[] commentField, long checksum, List<AuditEntry> auditEntries) {
         this.format = Objects.requireNonNull(format);
         this.comment = Objects.requireNonNull(comment);
-        this.bytes = Objects.requireNonNull(bytes);
+        this.data = Objects.requireNonNull(data);
         this.entries = List.copyOf(entries);
         this.commentField = commentField;
         this.checksum = checksum;
@@ -111,15 +127,25 @@ public final class PodArchive {
     /** POD2 audit trail in declaration order; empty for POD1 and EPD. */
     public List<AuditEntry> getAuditEntries() { return auditEntries; }
 
-    /** True when the POD2 checksum over bytes 8..EOF matches the header. */
+    /**
+     * The bytes behind the archive. Held open for as long as the archive is, so
+     * callers must close the archive when they are done with it.
+     */
+    public PodDataSource getData() { return data; }
+
+    /**
+     * True when the POD2 checksum over bytes 8..EOF matches the header. Streams the
+     * file rather than holding it; non-POD2 archives carry no checksum and pass.
+     */
     public boolean isChecksumValid() {
         return format != Format.POD2
-                || checksum == PodArchiveWriter.crc32Mpeg2(bytes, 8, bytes.length - 8);
+                || checksum == PodArchiveWriter.crc32Mpeg2(data, 8, data.length() - 8);
     }
 
-    /** True when a POD2 entry's stored CRC matches its payload. */
+    /** True when a POD2 entry's stored CRC matches its payload, streamed. */
     public boolean isEntryChecksumValid(Entry entry) {
-        return format != Format.POD2 || entry.checksum() == PodArchiveWriter.crc32Mpeg2(getEntryBytes(entry));
+        return format != Format.POD2
+                || entry.checksum() == PodArchiveWriter.crc32Mpeg2(data, entry.offset(), entry.length());
     }
 
     /**
@@ -145,13 +171,12 @@ public final class PodArchive {
      * @return the matching entry, or empty if not found
      */
     public Optional<Entry> findEntry(String name) {
-        String normalized = name.toUpperCase(Locale.ROOT);
-        for (Entry entry : entries) {
-            if (entry.name().toUpperCase(Locale.ROOT).equals(normalized)) {
-                return Optional.of(entry);
-            }
+        Map<String, Entry> index = byName;
+        if (index == null) {
+            index = buildIndex(Entry::name);
+            byName = index;
         }
-        return Optional.empty();
+        return Optional.ofNullable(index.get(name.toUpperCase(Locale.ROOT)));
     }
 
     /**
@@ -161,29 +186,51 @@ public final class PodArchive {
      * @param name bare filename, e.g. {@code "DEMO1.RAW"}
      */
     public Optional<Entry> findEntryByTitle(String name) {
-        String normalized = name.toUpperCase(Locale.ROOT);
-        for (Entry entry : entries) {
-            if (entry.title().equals(normalized)) {
-                return Optional.of(entry);
-            }
+        Map<String, Entry> index = byTitle;
+        if (index == null) {
+            index = buildIndex(Entry::title);
+            byTitle = index;
         }
-        return Optional.empty();
+        return Optional.ofNullable(index.get(name.toUpperCase(Locale.ROOT)));
     }
 
     /**
-     * Returns a copy of the raw bytes for a single entry.
+     * Indexes the entries by one of their names, upper-cased. Shipped and community
+     * archives do repeat a name, so the first occurrence is kept, matching what a
+     * linear scan returns.
+     */
+    private Map<String, Entry> buildIndex(Function<Entry, String> key) {
+        Map<String, Entry> index = new HashMap<>(entries.size() * 2);
+        for (Entry entry : entries) {
+            index.putIfAbsent(key.apply(entry).toUpperCase(Locale.ROOT), entry);
+        }
+        return index;
+    }
+
+    /**
+     * Returns a single entry's payload, read from the archive on demand. Bounds were
+     * validated at parse time, so the range is always inside the archive.
      *
-     * <p>The slice is taken directly from the in-memory archive bytes using
-     * {@link Entry#offset()} and {@link Entry#length()}.
+     * <p>Prefer {@link #copyEntryTo} when the bytes are only going to be written
+     * somewhere: this materializes the whole payload as one array.
      *
      * @param entry a directory entry belonging to this archive
      * @return copy of the entry's data bytes
-     * @throws ArithmeticException if offset or length overflows {@code int}
+     * @throws ArithmeticException if the length overflows {@code int}
      */
     public byte[] getEntryBytes(Entry entry) {
-        int start = Math.toIntExact(entry.offset());
-        int end   = Math.toIntExact(entry.offset() + entry.length());
-        return java.util.Arrays.copyOfRange(bytes, start, end);
+        return data.readExact(entry.offset(), Math.toIntExact(entry.length()));
+    }
+
+    /** Streams an entry's payload to {@code target} without holding it in memory. */
+    public void copyEntryTo(Entry entry, OutputStream target, byte[] scratch) throws IOException {
+        data.copyTo(entry.offset(), entry.length(), target, scratch);
+    }
+
+    /** Releases the archive's file handle. */
+    @Override
+    public void close() {
+        data.close();
     }
 
     /**

@@ -9,7 +9,7 @@ public final class AboutDialog extends JDialog {
     public AboutDialog(Frame owner) {
         super(owner, "About JPod", true);
 
-        JLabel title = new JLabel("JPod v1.3.0", SwingConstants.CENTER);
+        JLabel title = new JLabel("JPod v2.0.1", SwingConstants.CENTER);
         title.setFont(title.getFont().deriveFont(Font.BOLD, 22f));
 
         JLabel subtitle = new JLabel(

@@ -1,36 +1,40 @@
 package com.mtm2.jpod.ui;
 
 import com.mtm2.jpod.io.RawImageDecoder;
+import com.mtm2.jpod.io.image.PaletteResolver;
+import com.mtm2.jpod.io.image.TgaImageDecoder;
+import com.mtm2.jpod.io.image.TiffImageDecoder;
+import com.mtm2.jpod.io.model.SmfModelDecoder;
 import com.mtm2.jpod.io.pod.PodArchive;
 
 import javax.imageio.ImageIO;
 import javax.swing.*;
+import javax.swing.filechooser.FileNameExtensionFilter;
 import java.awt.*;
 import java.awt.image.BufferedImage;
 import java.io.ByteArrayInputStream;
+import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
-import java.util.Optional;
 
 /**
- * Floating preview window that dispatches display mode based on the entry's file extension.
+ * Floating preview window whose display mode comes from the entry's extension.
  *
  * <table>
+ *   <caption>Preview modes</caption>
  *   <tr><th>Extension(s)</th><th>Display mode</th></tr>
  *   <tr><td>{@code .raw}, {@code .clr}</td>
- *       <td>8-bit paletted image (64×64 art texture or 256×256 heightmap / CLR).
- *           Palette resolved via {@link #resolvePalette}: the palette named in the
- *           entry's own POD directory field, then same-name {@code .act} →
- *           directory sibling → {@code VGA.ACT} → {@code METALCR2.ACT} in archive →
- *           classpath resource → greyscale.</td></tr>
- *   <tr><td>{@code .act}</td><td>256-colour VGA palette swatch grid (16×16).</td></tr>
- *   <tr><td>{@code .wav}</td><td>Delegates to {@link AudioPlayerDialog}.</td></tr>
- *   <tr><td>{@code .bmp}, {@code .png}, {@code .jpg}, …</td>
- *       <td>Decoded by {@link javax.imageio.ImageIO}.</td></tr>
- *   <tr><td>{@code .txt}, {@code .def}, {@code .lvl}, {@code .sit}, …</td>
+ *       <td>8-bit paletted image with a live palette selector and Save as BMP. The
+ *           default palette follows {@link PaletteResolver}.</td></tr>
+ *   <tr><td>{@code .act}</td><td>256-colour palette swatch grid (16x16).</td></tr>
+ *   <tr><td>{@code .wav}, {@code .mod}</td><td>Handed to {@link AudioPlayerDialog}.</td></tr>
+ *   <tr><td>{@code .bin}, {@code .smf}</td><td>Handed to {@link ModelPreviewWindow}.</td></tr>
+ *   <tr><td>{@code .png}, {@code .tga}, {@code .tif}</td>
+ *       <td>Alpha-preserving image over a transparency checkerboard.</td></tr>
+ *   <tr><td>{@code .bmp}, {@code .jpg}, ...</td><td>Decoded by ImageIO.</td></tr>
+ *   <tr><td>{@code .txt}, {@code .def}, {@code .lvl}, {@code .sit}, ...</td>
  *       <td>Scrollable plain-text viewer (ISO-8859-1).</td></tr>
  *   <tr><td>anything else</td><td>Hex dump of the first 4 096 bytes.</td></tr>
  * </table>
@@ -39,115 +43,196 @@ public final class PreviewWindow extends JDialog {
 
     private static final int MAX_PREVIEW_W = 1024;
     private static final int MAX_PREVIEW_H = 768;
-    private boolean previewCancelled;
+    private static final int HEX_DUMP_LIMIT = 4096;
 
     /**
-     * Creates and lays out the preview window for the given archive entry.
-     *
-     * @param owner      parent frame used for relative positioning
-     * @param entryName  POD entry name (path separators may be {@code \} or {@code /});
-     *                   the extension determines which preview mode is used
-     * @param data       raw byte content of the entry
-     * @param archive    the open archive used to resolve a paired {@code .act} palette
-     *                   for {@code .raw} / {@code .clr} files; may be {@code null}
+     * The palette last chosen in any RAW preview. Picked again when another RAW offers
+     * the same option, so working through an archive needs the choice made once.
      */
-    public PreviewWindow(Frame owner, String entryName, byte[] data, PodArchive archive) {
-        this(owner, entryName, data, archive, null);
+    private static String savedRawPaletteLabel;
+
+    private boolean previewCancelled;
+
+    private PreviewWindow(Window owner, String entryName) {
+        super(owner, "Preview - " + entryName, ModalityType.APPLICATION_MODAL);
+        setDefaultCloseOperation(WindowConstants.DISPOSE_ON_CLOSE);
+        getRootPane().registerKeyboardAction(event -> dispose(),
+                KeyStroke.getKeyStroke("ESCAPE"), JComponent.WHEN_IN_FOCUSED_WINDOW);
     }
 
     /**
-     * @param nameField the entry's POD directory field, when the caller has it;
-     *                  it is what lets the stored palette name be used
+     * Opens the right window for an entry and blocks until it is closed. Audio goes
+     * to the player, models to the model viewer, and a cancelled RAW dimension prompt
+     * opens nothing at all.
+     *
+     * @param nameField the entry's POD directory field, when the caller has it; it is
+     *                  what lets the stored palette name be used
      */
-    public PreviewWindow(Frame owner, String entryName, byte[] data, PodArchive archive,
+    public static void open(Window owner, String entryName, byte[] data, PodArchive archive,
             byte[] nameField) {
-        super(owner, "Preview - " + entryName, true);
-        setDefaultCloseOperation(WindowConstants.DISPOSE_ON_CLOSE);
-
         String upper = entryName.toUpperCase(Locale.ROOT);
+        if (upper.endsWith(".WAV") || upper.endsWith(".MOD")) {
+            new AudioPlayerDialog(owner, entryName, data).setVisible(true);
+            return;
+        }
+        // The magic is checked too, so an entry whose extension is missing or wrong
+        // still opens as the model it is rather than falling through to a hex dump.
+        if (upper.endsWith(".BIN") || upper.endsWith(".SMF") || SmfModelDecoder.isSmfModel(data)) {
+            new ModelPreviewWindow(owner, entryName, data, archive).setVisible(true);
+            return;
+        }
 
+        PreviewWindow window = new PreviewWindow(owner, entryName);
+        window.build(entryName, data, archive, nameField);
+        if (window.previewCancelled) {
+            window.dispose();
+            return;
+        }
+        window.setLocationRelativeTo(owner);
+        window.setVisible(true);
+    }
+
+    private void build(String entryName, byte[] data, PodArchive archive, byte[] nameField) {
+        String upper = entryName.toUpperCase(Locale.ROOT);
         if (RawImageDecoder.isRawImage(upper)) {
             buildRawImagePanel(entryName, data, archive, nameField);
         } else if (RawImageDecoder.isActPalette(upper)) {
             buildActPalettePanel(entryName, data);
+        } else if (upper.endsWith(".TGA")) {
+            try {
+                buildImagePanel(TgaImageDecoder.decode(data, entryName), true);
+            } catch (IllegalArgumentException ex) {
+                buildMessage(ex.getMessage());
+            }
+        } else if (upper.endsWith(".TIF") || upper.endsWith(".TIFF")) {
+            buildTiff(entryName, data);
+        } else if (upper.endsWith(".PNG")) {
+            BufferedImage image = readImageQuietly(data);
+            if (image != null) buildImagePanel(image, true);
+            else buildMessage("Invalid PNG image.");
         } else if (RawImageDecoder.isTextFile(upper)) {
             buildTextPanel(data);
         } else {
-            // Try ImageIO first, fall back to hex dump
-            try {
-                BufferedImage img = ImageIO.read(new ByteArrayInputStream(data));
-                if (img != null) {
-                    buildImagePanel(img);
-                } else {
-                    buildHexPanel(data);
-                }
-            } catch (IOException ex) {
-                buildHexPanel(data);
-            }
+            // Not a format of ours; ImageIO may still know it, and if not, hex it is.
+            BufferedImage image = readImageQuietly(data);
+            if (image != null) buildImagePanel(image, false);
+            else buildHexPanel(data);
         }
-
-        setLocationRelativeTo(owner);
     }
 
     /**
-     * Opens the right window for an entry and blocks until it is closed.
-     *
-     * <p>A {@code .wav} goes straight to {@link AudioPlayerDialog}. Routing it
-     * here rather than inside the constructor is what lets this window be modal:
-     * the old placeholder frame disposed itself from an {@code invokeLater} that
-     * a modal dialog's nested event loop would have run at the wrong moment.
+     * Evo 2's palette TIFFs go through JPod's own decoder, which treats the second
+     * sample as opacity. Anything else it refuses is offered to ImageIO.
      */
-    public static void open(Frame owner, String entryName, byte[] data, PodArchive archive,
-            byte[] nameField) {
-        if (entryName.toUpperCase(Locale.ROOT).endsWith(".WAV")) {
-            new AudioPlayerDialog(owner, entryName, data).setVisible(true);
-            return;
+    private void buildTiff(String entryName, byte[] data) {
+        try {
+            buildImagePanel(TiffImageDecoder.decode(data, entryName), true);
+        } catch (IllegalArgumentException ex) {
+            BufferedImage image = readImageQuietly(data);
+            if (image != null) buildImagePanel(image, true);
+            else buildMessage(ex.getMessage());
         }
-
-        PreviewWindow window = new PreviewWindow(owner, entryName, data, archive, nameField);
-        if (window.isPreviewCancelled()) {
-            window.dispose();
-            return;
-        }
-
-        window.setVisible(true);
     }
 
-    public boolean isPreviewCancelled() {
-        return previewCancelled;
+    private static BufferedImage readImageQuietly(byte[] data) {
+        try {
+            return ImageIO.read(new ByteArrayInputStream(data));
+        } catch (IOException | RuntimeException ex) {
+            return null;
+        }
     }
 
     // -------------------------------------------------------------------------
     // RAW / CLR image
     // -------------------------------------------------------------------------
 
-    private void buildRawImagePanel(String entryName, byte[] data, PodArchive archive,
-            byte[] nameField) {
+    private void buildRawImagePanel(String entryName, byte[] data, PodArchive archive, byte[] nameField) {
+        PaletteResolver.Choices palettes = PaletteResolver.resolveChoices(entryName, archive, nameField);
+        int selectedIndex = palettes.defaultIndex();
+        if (savedRawPaletteLabel != null) {
+            int saved = palettes.indexOf(savedRawPaletteLabel);
+            if (saved >= 0) selectedIndex = saved;
+        }
+
         int[] dims = RawImageDecoder.detectDimensions(data.length);
-        int[] palette = resolvePalette(entryName, archive, nameField);
         if (dims == null) {
-            RawPreviewOptions options = promptForRawDimensions(entryName, data.length, archive, nameField);
+            RawPreviewOptions options = promptForRawDimensions(entryName, data.length, palettes, selectedIndex);
             if (options == null) {
                 previewCancelled = true;
                 return;
             }
             dims = options.dimensions();
-            palette = options.palette();
+            selectedIndex = options.paletteIndex();
         }
+        final int width = dims[0];
+        final int height = dims[1];
 
-        BufferedImage img = RawImageDecoder.decodeRaw(data, palette, dims[0], dims[1]);
+        JComboBox<PaletteResolver.Choice> palettePicker =
+                new JComboBox<>(palettes.choices().toArray(PaletteResolver.Choice[]::new));
+        palettePicker.setSelectedIndex(Math.max(0, Math.min(selectedIndex, palettes.choices().size() - 1)));
+        JButton save = new JButton("Save as BMP...");
 
-        // Scale up small textures so they're easy to see
-        if (dims[0] <= 64) img = scaleNearest(img, 4);
+        JPanel controls = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 4));
+        controls.add(new JLabel("Palette:"));
+        controls.add(palettePicker);
+        controls.add(save);
 
-        buildImagePanel(img);
+        ImageCanvas canvas = new ImageCanvas(false);
+        BufferedImage[] original = new BufferedImage[1];
+        Runnable repaint = () -> {
+            PaletteResolver.Choice choice = (PaletteResolver.Choice) palettePicker.getSelectedItem();
+            if (choice == null) return;
+            savedRawPaletteLabel = choice.label();
+            original[0] = RawImageDecoder.decodeRaw(data, choice.palette(), width, height);
+            // Art textures are tiny, so they are drawn at 4x with no smoothing.
+            canvas.setImage(width <= 64 ? scaleNearest(original[0], 4) : original[0]);
+        };
+        palettePicker.addActionListener(event -> repaint.run());
+        save.addActionListener(event -> saveAsBmp(entryName, original[0]));
+        repaint.run();
+
+        setLayout(new BorderLayout());
+        add(controls, BorderLayout.NORTH);
+        add(centered(canvas), BorderLayout.CENTER);
+        sizeToContent(canvas.getPreferredSize(), controls.getPreferredSize());
     }
 
+    private void saveAsBmp(String entryName, BufferedImage image) {
+        if (image == null) return;
+        JFileChooser chooser = new JFileChooser();
+        chooser.setDialogTitle("Save as BMP");
+        chooser.setFileFilter(new FileNameExtensionFilter("Bitmap image (*.bmp)", "bmp"));
+        String base = entryName.replace('\\', '/');
+        base = base.substring(base.lastIndexOf('/') + 1);
+        int dot = base.lastIndexOf('.');
+        chooser.setSelectedFile(new File((dot > 0 ? base.substring(0, dot) : base) + ".bmp"));
+        if (chooser.showSaveDialog(this) != JFileChooser.APPROVE_OPTION) return;
+        File target = chooser.getSelectedFile();
+        if (!target.getName().toLowerCase(Locale.ROOT).endsWith(".bmp")) {
+            target = new File(target.getParentFile(), target.getName() + ".bmp");
+        }
+        // BMP has no alpha, so the image is flattened to 24-bit first.
+        BufferedImage rgb = new BufferedImage(image.getWidth(), image.getHeight(), BufferedImage.TYPE_INT_RGB);
+        Graphics2D g = rgb.createGraphics();
+        g.drawImage(image, 0, 0, null);
+        g.dispose();
+        try {
+            ImageIO.write(rgb, "bmp", target);
+        } catch (IOException ex) {
+            JOptionPane.showMessageDialog(this, "Could not save the bitmap:\n" + ex.getMessage(),
+                    "JPod", JOptionPane.ERROR_MESSAGE);
+        }
+    }
+
+    /**
+     * Asks for width, height and palette when a RAW payload is not a recognized size.
+     * Width times height must match the payload exactly, so a wrong guess is rejected
+     * rather than drawn as garbage.
+     */
     private RawPreviewOptions promptForRawDimensions(String entryName, int byteCount,
-            PodArchive archive, byte[] nameField) {
+            PaletteResolver.Choices palettes, int selectedPalette) {
         List<int[]> suggestions = RawImageDecoder.suggestDimensions(byteCount);
-        int[] preferredDims = preferredDimensions(byteCount, suggestions);
-        PaletteChoices palettes = resolvePaletteChoices(entryName, archive, nameField);
+        int[] preferredDims = RawImageDecoder.preferredDimensions(byteCount);
 
         JPanel panel = new JPanel(new BorderLayout(0, 8));
         panel.add(new JLabel("<html>Select dimensions for <b>" + entryName + "</b><br>"
@@ -159,11 +244,10 @@ public final class PreviewWindow extends JDialog {
         gbc.anchor = GridBagConstraints.WEST;
 
         JComboBox<DimensionChoice> choices = new JComboBox<>();
+        // Twelve is enough to cover the plausible shapes without a scroll marathon.
         for (int[] suggestion : suggestions) {
             choices.addItem(new DimensionChoice(suggestion[0], suggestion[1]));
-            if (choices.getItemCount() == 12) {
-                break;
-            }
+            if (choices.getItemCount() == 12) break;
         }
 
         JSpinner widthSpinner = new JSpinner(new SpinnerNumberModel(
@@ -171,8 +255,9 @@ public final class PreviewWindow extends JDialog {
         JSpinner heightSpinner = new JSpinner(new SpinnerNumberModel(
                 preferredDims[1], 1, Math.max(1, byteCount), 1));
         JButton swapButton = new JButton("Swap");
-        JComboBox<PaletteChoice> paletteCombo = new JComboBox<>(palettes.choices().toArray(PaletteChoice[]::new));
-        paletteCombo.setSelectedIndex(Math.max(0, palettes.defaultIndex()));
+        JComboBox<PaletteResolver.Choice> paletteCombo =
+                new JComboBox<>(palettes.choices().toArray(PaletteResolver.Choice[]::new));
+        paletteCombo.setSelectedIndex(Math.max(0, Math.min(selectedPalette, palettes.choices().size() - 1)));
 
         choices.addActionListener(event -> {
             DimensionChoice selected = (DimensionChoice) choices.getSelectedItem();
@@ -187,229 +272,42 @@ public final class PreviewWindow extends JDialog {
             heightSpinner.setValue(width);
         });
 
-        gbc.gridx = 0;
-        gbc.gridy = 0;
-        form.add(new JLabel("Suggested sizes:"), gbc);
-        gbc.gridx = 1;
-        form.add(choices, gbc);
-
-        gbc.gridx = 0;
-        gbc.gridy = 1;
-        form.add(new JLabel("Width:"), gbc);
-        gbc.gridx = 1;
-        form.add(widthSpinner, gbc);
-
-        gbc.gridx = 0;
-        gbc.gridy = 2;
-        form.add(new JLabel("Height:"), gbc);
-        gbc.gridx = 1;
-        form.add(heightSpinner, gbc);
-
+        addRow(form, gbc, 0, "Suggested sizes:", choices);
+        addRow(form, gbc, 1, "Width:", widthSpinner);
+        addRow(form, gbc, 2, "Height:", heightSpinner);
         gbc.gridx = 1;
         gbc.gridy = 3;
         form.add(swapButton, gbc);
-
-        gbc.gridx = 0;
-        gbc.gridy = 4;
-        form.add(new JLabel("Palette:"), gbc);
-        gbc.gridx = 1;
-        form.add(paletteCombo, gbc);
-
+        addRow(form, gbc, 4, "Palette:", paletteCombo);
         panel.add(form, BorderLayout.CENTER);
 
         while (true) {
-            int result = JOptionPane.showConfirmDialog(
-                    this,
-                    panel,
-                    "RAW Dimensions",
-                    JOptionPane.OK_CANCEL_OPTION,
-                    JOptionPane.PLAIN_MESSAGE);
+            int result = JOptionPane.showConfirmDialog(getOwner(), panel, "RAW Dimensions",
+                    JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE);
             if (result != JOptionPane.OK_OPTION) {
                 return null;
             }
             int width = ((Number) widthSpinner.getValue()).intValue();
             int height = ((Number) heightSpinner.getValue()).intValue();
             long required = (long) width * height;
-            if (width <= 0 || height <= 0) {
-                JOptionPane.showMessageDialog(
-                        this,
-                        "Width and height must be positive.",
-                        "RAW Dimensions",
-                        JOptionPane.WARNING_MESSAGE);
-                continue;
-            }
             if (required != byteCount) {
-                JOptionPane.showMessageDialog(
-                        this,
-                        "Width × height must exactly match the RAW size.\n"
-                                + width + " × " + height + " = " + required
+                JOptionPane.showMessageDialog(getOwner(),
+                        "Width x height must exactly match the RAW size.\n"
+                                + width + " x " + height + " = " + required
                                 + " bytes, expected " + byteCount + ".",
-                        "RAW Dimensions",
-                        JOptionPane.WARNING_MESSAGE);
+                        "RAW Dimensions", JOptionPane.WARNING_MESSAGE);
                 continue;
             }
-            PaletteChoice paletteChoice = (PaletteChoice) paletteCombo.getSelectedItem();
-            return new RawPreviewOptions(
-                    new int[]{width, height},
-                    paletteChoice != null ? paletteChoice.palette() : RawImageDecoder.loadResourcePalette());
+            return new RawPreviewOptions(new int[] {width, height}, paletteCombo.getSelectedIndex());
         }
     }
 
-    private PaletteChoices resolvePaletteChoices(String entryName, PodArchive archive,
-            byte[] nameField) {
-        List<PaletteChoice> choices = new ArrayList<>();
-        int defaultIndex = -1;
-        if (archive != null) {
-            Optional<PodArchive.Entry> stored = findStoredPalette(archive, nameField);
-            if (stored.isPresent()) {
-                choices.add(new PaletteChoice(
-                        "Stored in the archive: " + stored.get().name(),
-                        tryDecodeAct(archive.getEntryBytes(stored.get()))));
-                defaultIndex = 0;
-            }
-
-            int dot = entryName.lastIndexOf('.');
-            if (dot > 0) {
-                String sameNameAct = entryName.substring(0, dot) + ".act";
-                Optional<PodArchive.Entry> sameNameEntry = archive.findEntry(sameNameAct);
-                if (sameNameEntry.isPresent()) {
-                    choices.add(new PaletteChoice(
-                            "Same-name ACT: " + sameNameEntry.get().name(),
-                            tryDecodeAct(archive.getEntryBytes(sameNameEntry.get()))));
-                    if (defaultIndex < 0) {
-                        defaultIndex = choices.size() - 1;
-                    }
-                }
-            }
-
-            Optional<PodArchive.Entry> vga = findArchivePalette(archive, "VGA.ACT");
-            if (vga.isPresent()) {
-                choices.add(new PaletteChoice("VGA.ACT", tryDecodeAct(archive.getEntryBytes(vga.get()))));
-                if (defaultIndex < 0) {
-                    defaultIndex = choices.size() - 1;
-                }
-            }
-
-            for (PodArchive.Entry entry : archive.getEntries()) {
-                String upperName = entry.name().toUpperCase(Locale.ROOT);
-                if (!upperName.endsWith(".ACT")) {
-                    continue;
-                }
-                if (upperName.endsWith("METALCR2.ACT") || upperName.endsWith("VGA.ACT")) {
-                    continue;
-                }
-                choices.add(new PaletteChoice("Archive ACT: " + entry.name(), tryDecodeAct(archive.getEntryBytes(entry))));
-            }
-
-            Optional<PodArchive.Entry> metalcr = findArchivePalette(archive, "METALCR2.ACT");
-            if (metalcr.isPresent()) {
-                choices.add(new PaletteChoice("METALCR2.ACT", tryDecodeAct(archive.getEntryBytes(metalcr.get()))));
-            }
-        }
-        int greyscaleIndex = choices.size();
-        choices.add(new PaletteChoice("Greyscale", RawImageDecoder.greyscalePalette()));
-        if (defaultIndex < 0) {
-            defaultIndex = greyscaleIndex;
-        }
-        if (choices.stream().noneMatch(choice -> choice.label().equals("METALCR2.ACT"))) {
-            choices.add(new PaletteChoice("Bundled METALCR2.ACT", RawImageDecoder.loadResourcePalette()));
-        }
-        return new PaletteChoices(List.copyOf(choices), defaultIndex);
-    }
-
-    private int[] preferredDimensions(int byteCount, List<int[]> suggestions) {
-        if (byteCount == 256000) {
-            return new int[]{640, 400};
-        }
-        if (byteCount == 64000) {
-            return new int[]{320, 200};
-        }
-        if (byteCount == 307200) {
-            return new int[]{640, 480};
-        }
-        if (!suggestions.isEmpty()) {
-            return suggestions.get(0);
-        }
-        return new int[]{byteCount, 1};
-    }
-
-    /**
-     * Resolves the palette for a .raw / .clr file, in priority order:
-     *
-     * 1. Same base-name .act in the archive  (demo1.raw  → demo1.act,
-     *                                          ART\W01.RAW → ART\W01.ACT)
-     * 2. Any other .act in the same archive directory
-     * 3. VGA.ACT anywhere in the archive
-     * 4. METALCR2.ACT anywhere in the archive (MTM1 default)
-     * 5. metalcr2.act bundled as a classpath resource  (src/main/resources/palettes/)
-     * 6. Greyscale fallback
-     */
-    private static int[] resolvePalette(String entryName, PodArchive archive, byte[] nameField) {
-
-        if (archive != null) {
-            // 0. The palette the packer recorded for this very entry. Where it
-            //    exists it beats every guess below: on MTM1, TV, Fury3 and
-            //    Hellbender the same-directory rule picks whichever ACT happens
-            //    to come first in the archive, which is almost never the right one.
-            Optional<PodArchive.Entry> stored = findStoredPalette(archive, nameField);
-            if (stored.isPresent()) return tryDecodeAct(archive.getEntryBytes(stored.get()));
-
-            // 1. Same base-name .act  (strip extension, append .act)
-            int dot = entryName.lastIndexOf('.');
-            if (dot > 0) {
-                String sameNameAct = entryName.substring(0, dot) + ".act";
-                Optional<PodArchive.Entry> exact = archive.findEntry(sameNameAct);
-                if (exact.isPresent()) return tryDecodeAct(archive.getEntryBytes(exact.get()));
-            }
-
-            // 2. Any .act in the same directory
-            int slash = Math.max(entryName.lastIndexOf('\\'), entryName.lastIndexOf('/'));
-            String dirPrefix = slash >= 0
-                    ? entryName.substring(0, slash + 1).toUpperCase(Locale.ROOT)
-                    : "";
-            for (PodArchive.Entry e : archive.getEntries()) {
-                String eName = e.name().toUpperCase(Locale.ROOT);
-                if (eName.startsWith(dirPrefix) && eName.endsWith(".ACT")) {
-                    return tryDecodeAct(archive.getEntryBytes(e));
-                }
-            }
-
-            // 3. VGA.ACT anywhere in the archive
-            Optional<PodArchive.Entry> vga = findArchivePalette(archive, "VGA.ACT");
-            if (vga.isPresent()) return tryDecodeAct(archive.getEntryBytes(vga.get()));
-
-            // 4. METALCR2.ACT anywhere in the archive
-            Optional<PodArchive.Entry> metalcr = findArchivePalette(archive, "METALCR2.ACT");
-            if (metalcr.isPresent()) return tryDecodeAct(archive.getEntryBytes(metalcr.get()));
-        }
-
-        // 5. Classpath resource (src/main/resources/palettes/metalcr2.act)
-        return RawImageDecoder.loadResourcePalette();
-    }
-
-    /**
-     * Returns the archive entry for the palette named in a directory field, or
-     * empty when the field names none or the archive does not hold it.
-     */
-    private static Optional<PodArchive.Entry> findStoredPalette(PodArchive archive, byte[] nameField) {
-        String palette = PodArchive.Entry.secondString(nameField);
-        if (palette == null || !palette.toUpperCase(Locale.ROOT).endsWith(".ACT")) {
-            return Optional.empty();
-        }
-        return findArchivePalette(archive, palette);
-    }
-
-    private static Optional<PodArchive.Entry> findArchivePalette(PodArchive archive, String fileName) {
-        Optional<PodArchive.Entry> entry = archive.findEntry(fileName);
-        if (entry.isPresent()) {
-            return entry;
-        }
-        return archive.findEntryByTitle(fileName);
-    }
-
-    private static int[] tryDecodeAct(byte[] bytes) {
-        try { return RawImageDecoder.decodeAct(bytes); }
-        catch (Exception e) { return RawImageDecoder.greyscalePalette(); }
+    private static void addRow(JPanel form, GridBagConstraints gbc, int row, String caption, JComponent field) {
+        gbc.gridx = 0;
+        gbc.gridy = row;
+        form.add(new JLabel(caption), gbc);
+        gbc.gridx = 1;
+        form.add(field, gbc);
     }
 
     // -------------------------------------------------------------------------
@@ -421,63 +319,55 @@ public final class PreviewWindow extends JDialog {
         try {
             palette = RawImageDecoder.decodeAct(data);
         } catch (IllegalArgumentException ex) {
-            buildUnsupported("Invalid ACT file: " + ex.getMessage());
+            buildMessage("Invalid ACT file: " + ex.getMessage());
             return;
         }
 
-        // Draw 16 × 16 grid of colour swatches (each 20 × 20 px)
-        final int SWATCH = 20;
-        final int COLS = 16;
-        final int ROWS = 16;
-        final int PANEL_W = COLS * SWATCH;
-        final int PANEL_H = ROWS * SWATCH;
-        final int[] pal = palette;
-
+        final int swatch = 20;
+        final int columns = 16;
+        final int side = columns * swatch;
         JPanel swatchPanel = new JPanel() {
             @Override protected void paintComponent(Graphics g) {
                 super.paintComponent(g);
                 for (int i = 0; i < 256; i++) {
-                    int col = i % COLS;
-                    int row = i / COLS;
-                    g.setColor(new Color(pal[i], true));
-                    g.fillRect(col * SWATCH, row * SWATCH, SWATCH, SWATCH);
+                    int col = i % columns;
+                    int row = i / columns;
+                    g.setColor(new Color(palette[i], true));
+                    g.fillRect(col * swatch, row * swatch, swatch, swatch);
                     g.setColor(Color.DARK_GRAY);
-                    g.drawRect(col * SWATCH, row * SWATCH, SWATCH - 1, SWATCH - 1);
+                    g.drawRect(col * swatch, row * swatch, swatch - 1, swatch - 1);
                 }
             }
-            @Override public Dimension getPreferredSize() { return new Dimension(PANEL_W, PANEL_H); }
+            @Override public Dimension getPreferredSize() { return new Dimension(side, side); }
         };
-        swatchPanel.setToolTipText("256-colour VGA palette from " + entryName);
-
-        // Show hex value in a tooltip on hover
+        swatchPanel.setToolTipText("256-colour palette from " + entryName);
+        // Hovering a swatch is the only practical way to read an index off the grid.
         swatchPanel.addMouseMotionListener(new java.awt.event.MouseMotionAdapter() {
             @Override public void mouseMoved(java.awt.event.MouseEvent e) {
-                int col = e.getX() / SWATCH;
-                int row = e.getY() / SWATCH;
-                int idx = row * COLS + col;
-                if (idx >= 0 && idx < 256) {
-                    swatchPanel.setToolTipText(String.format(
-                            "Index %d → #%06X", idx, pal[idx] & 0xFFFFFF));
+                int col = e.getX() / swatch;
+                int row = e.getY() / swatch;
+                int idx = row * columns + col;
+                if (col < columns && idx >= 0 && idx < 256) {
+                    swatchPanel.setToolTipText(String.format(Locale.ROOT,
+                            "Index %d - #%06X", idx, palette[idx] & 0xFFFFFF));
                 }
             }
         });
 
         JLabel header = new JLabel("256-colour VGA palette: " + entryName, SwingConstants.CENTER);
         header.setBorder(BorderFactory.createEmptyBorder(4, 4, 4, 4));
-
-        setLayout(new BorderLayout(0, 0));
+        setLayout(new BorderLayout());
         add(header, BorderLayout.NORTH);
         add(new JScrollPane(swatchPanel), BorderLayout.CENTER);
-        setSize(PANEL_W + 40, PANEL_H + 60);
+        setSize(side + 40, side + 70);
     }
 
     // -------------------------------------------------------------------------
-    // Text
+    // Text, images, hex
     // -------------------------------------------------------------------------
 
     private void buildTextPanel(byte[] data) {
-        String text = new String(data, StandardCharsets.ISO_8859_1);
-        JTextArea area = new JTextArea(text);
+        JTextArea area = new JTextArea(new String(data, StandardCharsets.ISO_8859_1));
         area.setEditable(false);
         area.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
         area.setCaretPosition(0);
@@ -486,50 +376,16 @@ public final class PreviewWindow extends JDialog {
         setSize(680, 520);
     }
 
-    // -------------------------------------------------------------------------
-    // ImageIO image
-    // -------------------------------------------------------------------------
-
-    private void buildImagePanel(BufferedImage img) {
-        JLabel label = new JLabel(new ImageIcon(img));
-        label.setHorizontalAlignment(SwingConstants.CENTER);
+    private void buildImagePanel(BufferedImage image, boolean checkerboard) {
+        ImageCanvas canvas = new ImageCanvas(checkerboard);
+        canvas.setImage(image);
         setLayout(new BorderLayout());
-        add(new JScrollPane(label));
-        setSize(Math.min(img.getWidth() + 40, MAX_PREVIEW_W),
-                Math.min(img.getHeight() + 60, MAX_PREVIEW_H));
+        add(centered(canvas), BorderLayout.CENTER);
+        sizeToContent(canvas.getPreferredSize(), null);
     }
 
-    // -------------------------------------------------------------------------
-    // Audio
-    // -------------------------------------------------------------------------
-
-    // -------------------------------------------------------------------------
-    // Hex dump fallback
-    // -------------------------------------------------------------------------
-
     private void buildHexPanel(byte[] data) {
-        int limit = Math.min(data.length, 4096);
-        StringBuilder sb = new StringBuilder();
-        sb.append(String.format(
-                "Binary data - first %d of %d bytes%n%n", limit, data.length));
-        for (int i = 0; i < limit; i += 16) {
-            sb.append(String.format("%06X  ", i));
-            for (int j = i; j < Math.min(i + 16, limit); j++) {
-                sb.append(String.format("%02X ", data[j] & 0xFF));
-                if (j == i + 7) sb.append(' ');
-            }
-            // Pad short last line
-            int lineLen = Math.min(16, limit - i);
-            int pad = (16 - lineLen) * 3 + (lineLen <= 8 ? 1 : 0);
-            sb.append(" ".repeat(pad));
-            sb.append(" |");
-            for (int j = i; j < Math.min(i + 16, limit); j++) {
-                char c = (char) (data[j] & 0xFF);
-                sb.append(Character.isISOControl(c) ? '.' : c);
-            }
-            sb.append("|\n");
-        }
-        JTextArea area = new JTextArea(sb.toString());
+        JTextArea area = new JTextArea(hexDump(data));
         area.setEditable(false);
         area.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 11));
         area.setCaretPosition(0);
@@ -538,20 +394,61 @@ public final class PreviewWindow extends JDialog {
         setSize(700, 500);
     }
 
-    // -------------------------------------------------------------------------
-    // Unsupported
-    // -------------------------------------------------------------------------
-
-    private void buildUnsupported(String message) {
-        JLabel lbl = new JLabel("<html><i>" + message + "</i></html>", SwingConstants.CENTER);
+    private void buildMessage(String message) {
+        JLabel label = new JLabel("<html><i>" + message + "</i></html>", SwingConstants.CENTER);
         setLayout(new BorderLayout());
-        add(lbl);
-        setSize(400, 120);
+        add(label);
+        setSize(420, 140);
     }
 
-    // -------------------------------------------------------------------------
-    // Helpers
-    // -------------------------------------------------------------------------
+    /**
+     * Classic 16-bytes-per-line dump with an ASCII gutter, capped so a 40 MB entry
+     * does not become a 40 MB string.
+     */
+    static String hexDump(byte[] data) {
+        int limit = Math.min(data.length, HEX_DUMP_LIMIT);
+        StringBuilder sb = new StringBuilder(limit * 4 + 64);
+        sb.append("Binary data - first ").append(limit).append(" of ").append(data.length)
+                .append(" bytes\n\n");
+        for (int i = 0; i < limit; i += 16) {
+            sb.append(String.format(Locale.ROOT, "%06X  ", i));
+            int lineLen = Math.min(16, limit - i);
+            for (int j = 0; j < lineLen; j++) {
+                sb.append(String.format(Locale.ROOT, "%02X ", data[i + j] & 0xFF));
+                if (j == 7) sb.append(' ');
+            }
+            sb.append(" ".repeat((16 - lineLen) * 3 + (lineLen <= 8 ? 1 : 0)));
+            sb.append(" |");
+            for (int j = 0; j < lineLen; j++) {
+                char c = (char) (data[i + j] & 0xFF);
+                sb.append(Character.isISOControl(c) ? '.' : c);
+            }
+            sb.append("|\n");
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Sizes the window to hold the image and the toolbar above it. Sizing from the
+     * image alone would push the toolbar's buttons off a small texture's window.
+     */
+    private void sizeToContent(Dimension content, Dimension toolbar) {
+        int barWidth = toolbar == null ? 0 : toolbar.width;
+        int barHeight = toolbar == null ? 0 : toolbar.height;
+        int width = Math.max(content.width + 40, barWidth + 24);
+        int height = content.height + barHeight + 60;
+        setSize(Math.min(width, MAX_PREVIEW_W), Math.min(height, MAX_PREVIEW_H));
+        if (toolbar != null) {
+            setMinimumSize(new Dimension(Math.min(barWidth + 24, MAX_PREVIEW_W), 200));
+        }
+    }
+
+    /** Keeps an image smaller than its viewport in the middle of it. */
+    private static JScrollPane centered(JComponent canvas) {
+        JPanel holder = new JPanel(new GridBagLayout());
+        holder.add(canvas);
+        return new JScrollPane(holder);
+    }
 
     /** Nearest-neighbour scale-up for small textures. */
     private static BufferedImage scaleNearest(BufferedImage src, int factor) {
@@ -566,6 +463,38 @@ public final class PreviewWindow extends JDialog {
         return out;
     }
 
+    /** Draws an image unscaled, optionally over a transparency checkerboard. */
+    private static final class ImageCanvas extends JComponent {
+        private final boolean checkerboard;
+        private BufferedImage image;
+
+        private ImageCanvas(boolean checkerboard) {
+            this.checkerboard = checkerboard;
+        }
+
+        private void setImage(BufferedImage replacement) {
+            image = replacement;
+            setPreferredSize(new Dimension(replacement.getWidth(), replacement.getHeight()));
+            revalidate();
+            repaint();
+        }
+
+        @Override
+        protected void paintComponent(Graphics g) {
+            if (image == null) return;
+            if (checkerboard) {
+                final int tile = 12;
+                for (int y = 0; y < image.getHeight(); y += tile) {
+                    for (int x = 0; x < image.getWidth(); x += tile) {
+                        g.setColor(((x / tile) + (y / tile)) % 2 == 0 ? Color.WHITE : Color.LIGHT_GRAY);
+                        g.fillRect(x, y, Math.min(tile, image.getWidth() - x), Math.min(tile, image.getHeight() - y));
+                    }
+                }
+            }
+            g.drawImage(image, 0, 0, null);
+        }
+    }
+
     private record DimensionChoice(int width, int height) {
         @Override
         public String toString() {
@@ -573,16 +502,5 @@ public final class PreviewWindow extends JDialog {
         }
     }
 
-    private record PaletteChoice(String label, int[] palette) {
-        @Override
-        public String toString() {
-            return label;
-        }
-    }
-
-    private record RawPreviewOptions(int[] dimensions, int[] palette) {
-    }
-
-    private record PaletteChoices(List<PaletteChoice> choices, int defaultIndex) {
-    }
+    private record RawPreviewOptions(int[] dimensions, int paletteIndex) {}
 }

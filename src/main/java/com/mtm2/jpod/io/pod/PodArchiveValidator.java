@@ -23,7 +23,9 @@ public final class PodArchiveValidator {
         PodArchive.Format actual = requested;
         try {
             actual = PodArchiveWriter.actualFormat(blobs, requested);
-            new PodArchiveWriter().buildBytes(comment, blobs,
+            // Checks the layout only, from names and lengths. Building the bytes here
+            // made renaming one entry cost a full serialization of every payload.
+            PodArchiveWriter.validateLayout(comment, blobs,
                     new PodArchiveWriter.WriteOptions(requested, null, List.of()));
         } catch (IOException | IllegalArgumentException | ArithmeticException ex) {
             errors.add(ex.getMessage());

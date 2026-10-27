@@ -11,8 +11,9 @@ import java.util.List;
  * RAW format (art\*.raw, data\*.raw, data\*.clr):
  *   A flat array of 8-bit palette indices with no header.
  *   Dimensions are inferred from the file size:
- *     4 096 bytes → 64 × 64  (art texture)
- *    65 536 bytes → 256 × 256  (heightmap / colour-lookup-table / CLR)
+ *     4 096 bytes: 64 x 64  (art texture)
+ *    65 536 bytes: 256 x 256  (heightmap / colour-lookup-table / CLR)
+ *    64 000, 256 000, 307 200 bytes: 320 x 200, 640 x 400, 640 x 480 screens
  *   Exact-square payloads fall back to {@code side × side}. Non-square payloads
  *   require the caller to choose dimensions explicitly.
  *
@@ -109,19 +110,45 @@ public final class RawImageDecoder {
      * @throws IllegalArgumentException if the byte array is smaller than {@code width × height}
      */
     public static BufferedImage decodeRaw(byte[] rawBytes, int[] palette, int width, int height) {
-        int required = width * height;
+        long required = (long) width * height;
         if (rawBytes.length < required) {
             throw new IllegalArgumentException(
                     "RAW data too short: expected " + required + " bytes, got " + rawBytes.length);
         }
-        BufferedImage img = new BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB);
-        for (int y = 0; y < height; y++) {
-            for (int x = 0; x < width; x++) {
-                int index = rawBytes[y * width + x] & 0xFF;
-                img.setRGB(x, y, palette[index]);
-            }
+        int[] pixels = new int[(int) required];
+        for (int i = 0; i < pixels.length; i++) {
+            pixels[i] = palette[rawBytes[i] & 0xFF];
         }
+        BufferedImage img = new BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB);
+        img.setRGB(0, 0, width, height, pixels, 0, width);
         return img;
+    }
+
+    /**
+     * Merges a 4x4 Evolution .OPA opacity plane into a decoded image's alpha channel.
+     *
+     * <p>An .OPA is an unheadered byte per pixel, paired with its texture by stem, and
+     * it holds a real gradient rather than a mask: AS3PINE1.OPA uses all 256 levels.
+     * That is the difference from the MTM family, which has no alpha anywhere and cuts
+     * texels by colour key instead; routing an .OPA through that path hardens every
+     * soft foliage edge into a stencil.
+     *
+     * <p>A plane whose length does not match the image's pixel count means the pairing
+     * was wrong rather than that the plane needs resampling, so it is ignored and the
+     * original image is returned.
+     */
+    public static BufferedImage applyOpacityPlane(BufferedImage image, byte[] opacityBytes) {
+        if (opacityBytes == null) return image;
+        int width = image.getWidth();
+        int height = image.getHeight();
+        if (opacityBytes.length != width * height) return image;
+        int[] pixels = image.getRGB(0, 0, width, height, null, 0, width);
+        for (int i = 0; i < pixels.length; i++) {
+            pixels[i] = (pixels[i] & 0x00FF_FFFF) | ((opacityBytes[i] & 0xFF) << 24);
+        }
+        BufferedImage merged = new BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB);
+        merged.setRGB(0, 0, width, height, pixels, 0, width);
+        return merged;
     }
 
     /**
@@ -131,6 +158,13 @@ public final class RawImageDecoder {
      * @return {@code int[2]} = {width, height}, or {@code null} if the size is unrecognised
      */
     public static int[] detectDimensions(int byteCount) {
+        // The three common VGA and SVGA screen sizes are recognized outright.
+        switch (byteCount) {
+            case 64000: return new int[]{320, 200};
+            case 256000: return new int[]{640, 400};
+            case 307200: return new int[]{640, 480};
+            default: break;
+        }
         if (byteCount == ART_TEXTURE_SIDE * ART_TEXTURE_SIDE) {
             return new int[]{ART_TEXTURE_SIDE, ART_TEXTURE_SIDE};
         }
@@ -168,6 +202,21 @@ public final class RawImageDecoder {
     }
 
     /**
+     * The width and height to preselect for a non-standard RAW payload. The three
+     * common VGA and SVGA screen sizes win over the most square-like factor pair.
+     */
+    public static int[] preferredDimensions(int byteCount) {
+        switch (byteCount) {
+            case 64000: return new int[]{320, 200};
+            case 256000: return new int[]{640, 400};
+            case 307200: return new int[]{640, 480};
+            default: break;
+        }
+        List<int[]> suggestions = suggestDimensions(byteCount);
+        return suggestions.isEmpty() ? new int[]{byteCount, 1} : suggestions.get(0);
+    }
+
+    /**
      * Returns {@code true} if the given filename (case-insensitive) has a raw image
      * extension supported by this decoder.
      */
@@ -188,13 +237,24 @@ public final class RawImageDecoder {
      */
     public static boolean isTextFile(String name) {
         String upper = name.toUpperCase(java.util.Locale.ROOT);
-        return upper.endsWith(".TXT") || upper.endsWith(".DEF") || upper.endsWith(".NAV")
-                || upper.endsWith(".TDF") || upper.endsWith(".TEX") || upper.endsWith(".LVL")
-                || upper.endsWith(".INI") || upper.endsWith(".LST") || upper.endsWith(".INF")
-                || upper.endsWith(".CFG") || upper.endsWith(".VOX") || upper.endsWith(".SIT")
-                || upper.endsWith(".TRN") || upper.endsWith(".NDX") || upper.endsWith(".TNL")
-                || upper.endsWith(".TTX") || upper.endsWith(".TRK");
+        for (String extension : TEXT_EXTENSIONS) {
+            if (upper.endsWith(extension)) {
+                return true;
+            }
+        }
+        return false;
     }
+
+    private static final String[] TEXT_EXTENSIONS = {
+            ".TXT", ".DEF", ".NAV", ".TDF", ".TEX", ".LVL", ".INI", ".LST", ".INF",
+            ".CFG", ".VOX", ".SIT", ".TRN", ".NDX", ".TNL", ".TTX", ".TRK",
+            ".MIC", ".JSON", ".CRS", ".DVP", ".GLT", ".PIT", ".LVO", ".LOC",
+            ".DMO", ".LOG", ".CMD", ".CAR", ".200", ".400", ".480", ".ANI",
+            ".KLP", ".SET", ".TTY", ".SI2", ".TXV", ".VEG", ".WAT",
+            // Disabled tracks and trucks keep their original text payload; only the
+            // extension changes, so they stay readable in the preview.
+            ".SIX", ".SIY", ".TRX",
+    };
 
     /**
      * Loads the default Metal Crusher palette bundled as a package-relative
@@ -207,12 +267,21 @@ public final class RawImageDecoder {
      * Falls back to greyscale if the resource is absent.
      */
     public static int[] loadResourcePalette() {
-        try (java.io.InputStream in =
-                     RawImageDecoder.class.getResourceAsStream("/com/mtm2/jpod/palettes/metalcr2.act")) {
-            if (in != null) {
-                return decodeAct(in.readAllBytes());
+        int[] cached = resourcePalette;
+        if (cached == null) {
+            cached = greyscalePalette();
+            try (java.io.InputStream in =
+                         RawImageDecoder.class.getResourceAsStream("/com/mtm2/jpod/palettes/metalcr2.act")) {
+                if (in != null) {
+                    cached = decodeAct(in.readAllBytes());
+                }
+            } catch (Exception ignored) {
+                // A missing or unreadable palette is not worth failing a preview over.
             }
-        } catch (Exception ignored) {}
-        return greyscalePalette();
+            resourcePalette = cached;
+        }
+        return cached.clone();
     }
+
+    private static volatile int[] resourcePalette;
 }

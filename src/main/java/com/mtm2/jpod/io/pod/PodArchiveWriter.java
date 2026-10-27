@@ -1,31 +1,50 @@
 package com.mtm2.jpod.io.pod;
 
+import java.io.BufferedOutputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.FilterOutputStream;
 import java.io.IOException;
+import java.io.OutputStream;
+import java.io.UncheckedIOException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.channels.Channels;
+import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.time.Instant;
-import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 
 /**
- * Builds and writes Terminal Reality POD archives from an in-memory blob list.
+ * Builds and writes Terminal Reality POD archives.
  *
- * <p>The binary layout produced is:
+ * <p>The POD1 layout produced is:
  * <pre>
  *   4 bytes   item count (int32 LE)
- *  80 bytes   comment, null-padded (ISO-8859-1, truncated to 79 usable chars)
- *  N × 40     directory table — for each entry:
+ *  80 bytes   comment, null-padded (ISO-8859-1, at most 79 usable bytes)
+ *  N x 40     directory table, for each entry:
  *               32 bytes  name, null-padded (ISO-8859-1)
  *                4 bytes  data length (uint32 LE)
  *                4 bytes  data offset from file start (uint32 LE)
- *   …         raw file data concatenated in directory order
+ *   ...       raw file data concatenated in directory order
  * </pre>
  *
  * <p>A name that does not fit the 31-byte budget is a refusal naming the entry and
  * its length, never a truncation: a truncated name packs without error and then
  * simply never resolves in game.
+ *
+ * <p>Archives are written straight to the output, one payload at a time through a
+ * shared transfer buffer, so building a 200 MB archive costs the directory plus that
+ * buffer rather than the archive twice over. {@link #write(Path, String, List,
+ * WriteOptions, Runnable)} builds beside the target and moves it into place, which
+ * keeps a failed write from destroying the original and makes it safe to save over
+ * an archive that is currently open for reading.
  *
  * <p>Entry names are written exactly as supplied; callers are responsible for
  * uppercasing if the target game requires it. The engine uppercases every name at
@@ -41,29 +60,37 @@ public final class PodArchiveWriter {
     private static final int POD2_ENTRY_SIZE = 20;
     /**
      * Matches the reader's limit, so anything JPod can open it can also save.
-     * Hellbender's {@code GAME.POD} holds 4 341 entries and used to read fine but
-     * fail on save against the old 4 096 cap.
+     * Hellbender's {@code GAME.POD} holds 4 341 entries.
      */
-    private static final int MAX_ITEMS       = 8192;
+    private static final int MAX_ITEMS       = PodArchiveReader.MAX_REASONABLE_ITEMS;
 
     /** Longest entry name a POD1 directory can store, excluding the terminator. */
     public static final int MAX_NAME_LENGTH  = ENTRY_NAME_SIZE - 1;
 
+    /** Width of a POD1 directory name field. */
+    public static final int CLASSIC_NAME_FIELD_SIZE = ENTRY_NAME_SIZE;
+
+    /** Width of a POD1 directory record. */
+    public static final int CLASSIC_ENTRY_SIZE = ENTRY_SIZE;
+
+    /** Suffix of the temporary file a write builds before replacing the target. */
+    private static final String TEMP_SUFFIX = ".jpodtmp";
+
+    /** Initial value of a POD2 checksum, and the seed to start one with. */
+    public static final int CRC32_SEED = 0xFFFF_FFFF;
+
+    /** One entry per leading byte value: a byte costs a lookup instead of eight steps. */
+    private static final int[] CRC32_TABLE = buildCrc32Table();
+
     /**
-     * Builds the archive bytes and writes them atomically to {@code path}.
+     * Builds the archive and writes it to {@code path}.
      *
-     * <p>Parent directories are created if absent.
-     *
-     * @param path    destination file (created or overwritten)
-     * @param comment up to 79-byte archive comment (rejected if longer)
-     * @param blobs   ordered list of entries to pack; must not be empty
      * @return the directory layout written: {@link PodArchive.Format#POD1}, or
      *         {@link PodArchive.Format#POD2} when that was requested
      * @throws IllegalArgumentException if {@code blobs} is null or empty
-     * @throws IOException              if any entry count exceeds {@value MAX_ITEMS},
-     *                                  if a name is longer than
-     *                                  {@value #MAX_NAME_LENGTH} bytes, on offset
-     *                                  overflow, or on write failure
+     * @throws IOException              if the entry count exceeds the limit, a name is
+     *                                  longer than {@value #MAX_NAME_LENGTH} bytes, on
+     *                                  offset overflow, or on write failure
      */
     public PodArchive.Format write(Path path, String comment, List<Blob> blobs) throws IOException {
         return write(path, comment, blobs,
@@ -80,17 +107,71 @@ public final class PodArchiveWriter {
                 new WriteOptions(PodArchive.Format.POD1, commentField, List.of()));
     }
 
-    /** Writes an explicitly selected POD1-family or POD2 archive. */
+    /** Writes an explicitly selected POD1 or POD2 archive. */
     public PodArchive.Format write(Path path, String comment, List<Blob> blobs,
             WriteOptions options) throws IOException {
+        return write(path, comment, blobs, options, null);
+    }
+
+    /**
+     * Writes an archive beside {@code path} and moves it into place.
+     *
+     * @param beforeReplace runs once the new archive is complete on disk and before
+     *        it takes the target's place. A caller that is reading from the target,
+     *        which is what saving over the archive you have open means, releases its
+     *        handle here: every payload has been streamed out by then.
+     */
+    public PodArchive.Format write(Path path, String comment, List<Blob> blobs,
+            WriteOptions options, Runnable beforeReplace) throws IOException {
+        validateLayout(comment, blobs, options);
         PodArchive.Format actual = actualFormat(blobs, options.format());
-        byte[] bytes = buildBytes(comment, blobs, options);
-        Path parent = path.getParent();
+        Path absolute = path.toAbsolutePath();
+        Path parent = absolute.getParent();
         if (parent != null) {
             Files.createDirectories(parent);
         }
-        Files.write(path, bytes);
+
+        // Build beside the target and swap. Until the swap the target is untouched,
+        // so a source archive being read from can also be the destination.
+        Path temp = absolute.resolveSibling(absolute.getFileName() + TEMP_SUFFIX);
+        try {
+            try (FileChannel channel = FileChannel.open(temp, StandardOpenOption.CREATE,
+                    StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) {
+                OutputStream output = new BufferedOutputStream(
+                        Channels.newOutputStream(channel), PodDataSource.SCRATCH_SIZE);
+                try {
+                    if (actual == PodArchive.Format.POD2) {
+                        int crc = writePod2(output, comment, blobs, options.auditEntries());
+                        output.flush();
+                        ByteBuffer field = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN);
+                        field.putInt(crc).flip();
+                        channel.write(field, 4);
+                    } else {
+                        writePod1(output, comment, blobs, options.commentField());
+                        output.flush();
+                    }
+                } catch (UncheckedIOException ex) {
+                    throw ex.getCause();
+                }
+            }
+            if (beforeReplace != null) {
+                beforeReplace.run();
+            }
+            replace(temp, absolute);
+        } finally {
+            Files.deleteIfExists(temp);
+        }
         return actual;
+    }
+
+    /** Moves the finished temporary file onto the target path. */
+    private static void replace(Path temp, Path path) throws IOException {
+        try {
+            Files.move(temp, path, StandardCopyOption.REPLACE_EXISTING,
+                    StandardCopyOption.ATOMIC_MOVE);
+        } catch (AtomicMoveNotSupportedException ex) {
+            Files.move(temp, path, StandardCopyOption.REPLACE_EXISTING);
+        }
     }
 
     /**
@@ -113,22 +194,29 @@ public final class PodArchiveWriter {
     }
 
     /**
-     * Builds and returns the complete POD binary without writing to disk.
+     * Every check a write performs, without producing the archive. The directory
+     * constraints come from the names and the overflow checks from the lengths, so
+     * no payload is read: renaming one entry in a large archive stays cheap.
+     */
+    public static void validateLayout(String comment, List<Blob> blobs, WriteOptions options)
+            throws IOException {
+        validateInputs(comment, blobs, options.allowDuplicateNames());
+        PodArchive.Format actual = actualFormat(blobs, options.format());
+        if (actual == PodArchive.Format.POD2) {
+            pod2Layout(comment, blobs, options.auditEntries());
+        } else {
+            pod1Layout(blobs);
+        }
+    }
+
+    /**
+     * Builds and returns the complete POD binary without writing to disk. Kept for
+     * fixtures and in-memory callers; {@link #write} streams instead.
      *
-     * <p>Offsets in the directory table are computed automatically; the caller
-     * does not need to pre-calculate them.
-     *
-     * <p>The POD1 directory is always the 40-byte record. A name that does not fit
-     * in 31 bytes is refused, not truncated and not widened.
-     *
-     * @param comment up to 79-character archive comment
-     * @param blobs   entries to include; order determines directory and data layout
-     * @return complete POD file contents as a byte array
      * @throws IllegalArgumentException if {@code blobs} is null or empty
-     * @throws IOException              if entry count exceeds {@value MAX_ITEMS},
-     *                                  if a name is longer than
-     *                                  {@value #MAX_NAME_LENGTH} bytes, or if the
-     *                                  total size overflows {@code int}
+     * @throws IOException              if the entry count exceeds the limit, a name is
+     *                                  longer than {@value #MAX_NAME_LENGTH} bytes, or
+     *                                  the total size overflows {@code int}
      */
     public byte[] buildBytes(String comment, List<Blob> blobs) throws IOException {
         return buildBytes(comment, blobs,
@@ -146,74 +234,122 @@ public final class PodArchiveWriter {
 
     /** Builds POD1 or POD2 according to explicit write options. */
     public byte[] buildBytes(String comment, List<Blob> blobs, WriteOptions options) throws IOException {
-        validateInputs(comment, blobs, options.allowDuplicateNames());
+        validateLayout(comment, blobs, options);
         PodArchive.Format actual = actualFormat(blobs, options.format());
-        if (actual == PodArchive.Format.POD2) {
-            return buildPod2(comment, blobs, options.auditEntries());
+        int total = 0;
+        for (Blob blob : blobs) total = Math.addExact(total, blob.length());
+        ByteArrayOutputStream out = new ByteArrayOutputStream(total + 1024);
+        try {
+            if (actual == PodArchive.Format.POD2) {
+                int crc = writePod2(out, comment, blobs, options.auditEntries());
+                byte[] result = out.toByteArray();
+                writeInt32At(result, 4, crc);
+                return result;
+            }
+            writePod1(out, comment, blobs, options.commentField());
+        } catch (UncheckedIOException ex) {
+            throw ex.getCause();
         }
-        return buildPod1(comment, blobs, options.commentField());
-    }
-
-    private byte[] buildPod1(String comment, List<Blob> blobs, byte[] commentField)
-            throws IOException {
-        int nameSize = ENTRY_NAME_SIZE;
-        for (Blob blob : blobs) {
-            checkNameFits(blob);
-        }
-        int entrySize  = nameSize + Integer.BYTES + Integer.BYTES;
-        int headerSize = Math.addExact(Integer.BYTES + COMMENT_SIZE,
-                Math.multiplyExact(blobs.size(), entrySize));
-        int[] offsets = offsetsFor(blobs, headerSize);
-
-        int total = headerSize;
-        for (Blob blob : blobs) total = Math.addExact(total, blob.data().length);
-        ByteArrayOutputStream out = new ByteArrayOutputStream(total);
-        writeInt32(out, blobs.size());
-        writeCommentField(out, comment, commentField);
-        for (int i = 0; i < blobs.size(); i++) {
-            writeNameField(out, blobs.get(i), nameSize);
-            writeInt32(out, blobs.get(i).data().length);
-            writeInt32(out, offsets[i]);
-        }
-        for (Blob blob : blobs) out.writeBytes(blob.data());
         return out.toByteArray();
     }
 
-    private byte[] buildPod2(String comment, List<Blob> blobs,
+    // -------------------------------------------------------------------------
+    // Layout: everything that can be decided from names and lengths alone
+    // -------------------------------------------------------------------------
+
+    private record Pod1Plan(int headerSize, int[] offsets) {}
+
+    private record Pod2Plan(byte[] names, int[] nameOffsets, int dataStart, int[] offsets) {}
+
+    private static Pod1Plan pod1Layout(List<Blob> blobs) throws IOException {
+        for (Blob blob : blobs) {
+            checkNameFits(blob);
+        }
+        int headerSize;
+        try {
+            headerSize = Math.addExact(Integer.BYTES + COMMENT_SIZE,
+                    Math.multiplyExact(blobs.size(), ENTRY_SIZE));
+        } catch (ArithmeticException ex) {
+            throw new IOException("POD directory is too large", ex);
+        }
+        return new Pod1Plan(headerSize, offsetsFor(blobs, headerSize));
+    }
+
+    private static Pod2Plan pod2Layout(String comment, List<Blob> blobs,
             List<PodArchive.AuditEntry> audits) throws IOException {
-        if (audits.size() > MAX_ITEMS) throw new IOException("Too many POD2 audit records: " + audits.size());
-        for (PodArchive.AuditEntry audit : audits) validateAudit(audit);
+        if (audits.size() > MAX_ITEMS) {
+            throw new IOException("Too many POD2 audit records: " + audits.size());
+        }
+        checkFixedField(comment, COMMENT_SIZE, "POD2 comment");
+        for (PodArchive.AuditEntry audit : audits) {
+            validateAudit(audit);
+            checkFixedField(audit.user(), 32, "Audit user");
+            checkFixedField(audit.entryPath(), 256, "Audit entry path");
+        }
         ByteArrayOutputStream names = new ByteArrayOutputStream();
         int[] nameOffsets = new int[blobs.size()];
         for (int i = 0; i < blobs.size(); i++) {
             nameOffsets[i] = names.size();
-            byte[] name = blobs.get(i).name().getBytes(StandardCharsets.ISO_8859_1);
-            names.writeBytes(name);
+            names.writeBytes(blobs.get(i).name().getBytes(StandardCharsets.ISO_8859_1));
             names.write(0);
         }
-        int dataStart = Math.addExact(POD2_HEADER_SIZE,
-                Math.addExact(Math.multiplyExact(blobs.size(), POD2_ENTRY_SIZE), names.size()));
-        int[] offsets = offsetsFor(blobs, dataStart);
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-        out.writeBytes(new byte[] {'P', 'O', 'D', '2'});
-        writeInt32(out, 0);
-        writeFixedStrict(out, comment, COMMENT_SIZE, "POD2 comment");
+        byte[] nameBlob = names.toByteArray();
+        int dataStart;
+        try {
+            dataStart = Math.addExact(POD2_HEADER_SIZE,
+                    Math.addExact(Math.multiplyExact(blobs.size(), POD2_ENTRY_SIZE), nameBlob.length));
+        } catch (ArithmeticException ex) {
+            throw new IOException("POD2 directory is too large", ex);
+        }
+        return new Pod2Plan(nameBlob, nameOffsets, dataStart, offsetsFor(blobs, dataStart));
+    }
+
+    // -------------------------------------------------------------------------
+    // Writing
+    // -------------------------------------------------------------------------
+
+    private static void writePod1(OutputStream out, String comment, List<Blob> blobs,
+            byte[] commentField) throws IOException {
+        Pod1Plan plan = pod1Layout(blobs);
         writeInt32(out, blobs.size());
-        writeInt32(out, audits.size());
+        writeCommentField(out, comment, commentField);
+        for (int i = 0; i < blobs.size(); i++) {
+            writeNameField(out, blobs.get(i));
+            writeInt32(out, blobs.get(i).length());
+            writeInt32(out, plan.offsets()[i]);
+        }
+        byte[] scratch = PodDataSource.newScratch();
+        for (Blob blob : blobs) blob.copyTo(out, scratch);
+    }
+
+    /**
+     * Writes a POD2 archive with a zero checksum field and returns the checksum that
+     * belongs there. It covers everything after the field, so it is accumulated as
+     * the bytes go past rather than by reading the finished archive back.
+     */
+    private static int writePod2(OutputStream out, String comment, List<Blob> blobs,
+            List<PodArchive.AuditEntry> audits) throws IOException {
+        Pod2Plan plan = pod2Layout(comment, blobs, audits);
+        byte[] scratch = PodDataSource.newScratch();
+        out.write(new byte[] {'P', 'O', 'D', '2'});
+        writeInt32(out, 0);
+        CrcOutputStream hashed = new CrcOutputStream(out);
+        writeFixedStrict(hashed, comment, COMMENT_SIZE, "POD2 comment");
+        writeInt32(hashed, blobs.size());
+        writeInt32(hashed, audits.size());
         for (int i = 0; i < blobs.size(); i++) {
             Blob blob = blobs.get(i);
-            writeInt32(out, nameOffsets[i]);
-            writeInt32(out, blob.data().length);
-            writeInt32(out, offsets[i]);
-            writeInt32(out, (int) blob.timestamp());
-            writeInt32(out, (int) crc32Mpeg2(blob.data()));
+            writeInt32(hashed, plan.nameOffsets()[i]);
+            writeInt32(hashed, blob.length());
+            writeInt32(hashed, plan.offsets()[i]);
+            writeInt32(hashed, (int) blob.timestamp());
+            writeInt32(hashed, (int) blob.crc32Mpeg2(scratch));
         }
-        out.writeBytes(names.toByteArray());
-        for (Blob blob : blobs) out.writeBytes(blob.data());
-        for (PodArchive.AuditEntry audit : audits) writeAudit(out, audit);
-        byte[] result = out.toByteArray();
-        writeInt32At(result, 4, (int) crc32Mpeg2(result, 8, result.length - 8));
-        return result;
+        hashed.write(plan.names());
+        for (Blob blob : blobs) blob.copyTo(hashed, scratch);
+        for (PodArchive.AuditEntry audit : audits) writeAudit(hashed, audit);
+        hashed.flush();
+        return hashed.crc;
     }
 
     /**
@@ -237,12 +373,11 @@ public final class PodArchiveWriter {
         if (nameByteLength(comment) > COMMENT_SIZE - 1) {
             throw new IOException("POD comment exceeds 79 bytes");
         }
-        java.util.HashSet<String> names = new java.util.HashSet<>();
+        HashSet<String> names = new HashSet<>();
         for (Blob blob : blobs) {
             String normalized = normalizeName(blob.name());
             validatePath(normalized);
-            if (!names.add(normalized.toUpperCase(java.util.Locale.ROOT))
-                    && !allowDuplicateNames) {
+            if (!names.add(normalized.toUpperCase(Locale.ROOT)) && !allowDuplicateNames) {
                 throw new IOException("Duplicate POD entry name: " + normalized);
             }
             if (blob.timestamp() < 0 || blob.timestamp() > 0xFFFF_FFFFL) {
@@ -251,12 +386,16 @@ public final class PodArchiveWriter {
         }
     }
 
-    private static int[] offsetsFor(List<Blob> blobs, int headerSize) {
+    private static int[] offsetsFor(List<Blob> blobs, int headerSize) throws IOException {
         int[] offsets = new int[blobs.size()];
         int cursor = headerSize;
-        for (int i = 0; i < blobs.size(); i++) {
-            offsets[i] = cursor;
-            cursor = Math.addExact(cursor, blobs.get(i).data().length);
+        try {
+            for (int i = 0; i < blobs.size(); i++) {
+                offsets[i] = cursor;
+                cursor = Math.addExact(cursor, blobs.get(i).length());
+            }
+        } catch (ArithmeticException ex) {
+            throw new IOException("POD archive would exceed 2 GB", ex);
         }
         return offsets;
     }
@@ -267,13 +406,14 @@ public final class PodArchiveWriter {
      * to, which is what preserves anything after the terminator through an open and
      * save. An edited comment is written fresh.
      */
-    private static void writeCommentField(ByteArrayOutputStream out, String comment, byte[] original) {
+    private static void writeCommentField(OutputStream out, String comment, byte[] original)
+            throws IOException {
         String text = comment != null ? comment : "";
         if (original != null && original.length == COMMENT_SIZE && decodeField(original).equals(text)) {
             out.write(original, 0, COMMENT_SIZE);
             return;
         }
-        writeFixedAscii(out, comment, COMMENT_SIZE);
+        writeFixedStrict(out, comment, COMMENT_SIZE, "POD comment");
     }
 
     /** Decodes a field the way the reader does, so the two can be compared. */
@@ -288,25 +428,21 @@ public final class PodArchiveWriter {
     /**
      * Writes one directory name field.
      *
-     * <p>When the entry came from an archive and its original field fits the
-     * layout being written, those bytes go back out verbatim, so anything after
-     * the terminator survives a re-save. Most archives leave only zeros there;
-     * Fury3's {@code FURYSE.POD} packs a second null-terminated {@code .ACT}
-     * name into the spare bytes of every {@code ART\*.RAW} entry. Nothing
-     * documents that and nothing here reads past the first terminator, but
-     * re-saving should not silently drop bytes that were in the file.
-     *
-     * <p>A field wider than the target layout cannot be copied, so it is rebuilt
-     * from the name instead.
+     * <p>When the entry came from an archive and its original field still names it,
+     * those bytes go back out verbatim, so anything after the terminator survives a
+     * re-save. Most archives leave only zeros there; Fury3's {@code FURYSE.POD}
+     * packs a second null-terminated {@code .ACT} name into the spare bytes of every
+     * {@code ART\*.RAW} entry. A renamed entry is rebuilt from its name, carrying
+     * the palette record forward.
      */
-    private static void writeNameField(ByteArrayOutputStream out, Blob blob, int nameSize) {
+    private static void writeNameField(OutputStream out, Blob blob) throws IOException {
         byte[] original = blob.nameField();
-        if (original != null && original.length == nameSize
+        if (original != null && original.length == ENTRY_NAME_SIZE
                 && decodeField(original).equals(blob.name())) {
             out.write(original, 0, original.length);
             return;
         }
-        byte[] field = new byte[nameSize];
+        byte[] field = new byte[ENTRY_NAME_SIZE];
         byte[] name = blob.name().getBytes(StandardCharsets.ISO_8859_1);
         System.arraycopy(name, 0, field, 0, name.length);
         String palette = blob.embeddedPaletteName();
@@ -314,22 +450,23 @@ public final class PodArchiveWriter {
             byte[] pal = palette.getBytes(StandardCharsets.ISO_8859_1);
             System.arraycopy(pal, 0, field, name.length + 1, pal.length);
         }
-        out.writeBytes(field);
+        out.write(field);
     }
 
-    /** Writes a fixed-length, null-padded ISO-8859-1 string field. */
-    private static void writeFixedAscii(ByteArrayOutputStream out, String value, int length) {
-        byte[] bytes = value != null ? value.getBytes(StandardCharsets.ISO_8859_1) : new byte[0];
-        int copyLength = Math.min(bytes.length, length - 1);
-        out.write(bytes, 0, copyLength);
-        if (copyLength < length) {
-            out.writeBytes(new byte[length - copyLength]);
-        }
-    }
-
-    /** Returns the ISO-8859-1 byte length of an entry name, excluding the terminator. */
+    /** Returns the ISO-8859-1 byte length of a name, excluding the terminator. */
     private static int nameByteLength(String name) {
         return name != null ? name.getBytes(StandardCharsets.ISO_8859_1).length : 0;
+    }
+
+    /**
+     * Bytes a directory name field must hold for this name and palette name,
+     * terminators included. Exposed so callers can find the entries that will not fit
+     * without building a blob per entry.
+     */
+    public static int requiredNameFieldBytes(String name, String embeddedPaletteName) {
+        int length = nameByteLength(name) + 1;
+        return embeddedPaletteName == null || embeddedPaletteName.isBlank()
+                ? length : length + nameByteLength(embeddedPaletteName) + 1;
     }
 
     /**
@@ -350,17 +487,12 @@ public final class PodArchiveWriter {
             throw new IOException("POD entry name is " + name + " bytes; POD1 holds "
                     + MAX_NAME_LENGTH + ": " + blob.name());
         }
-        if (requiredNameFieldLength(blob) > ENTRY_NAME_SIZE) {
+        int required = requiredNameFieldBytes(blob.name(), blob.embeddedPaletteName());
+        if (required > ENTRY_NAME_SIZE) {
             throw new IOException("POD entry name plus its embedded palette record is "
-                    + requiredNameFieldLength(blob) + " bytes; the directory field holds "
+                    + required + " bytes; the directory field holds "
                     + ENTRY_NAME_SIZE + ": " + blob.name() + " + " + blob.embeddedPaletteName());
         }
-    }
-
-    private static int requiredNameFieldLength(Blob blob) {
-        int length = nameByteLength(blob.name()) + 1;
-        String palette = blob.embeddedPaletteName();
-        return palette == null || palette.isBlank() ? length : length + nameByteLength(palette) + 1;
     }
 
     /** Canonical archive paths use backslashes and never rooted/traversal components. */
@@ -383,15 +515,21 @@ public final class PodArchiveWriter {
         }
     }
 
-    private static void writeFixedStrict(ByteArrayOutputStream out, String value, int size,
+    private static void checkFixedField(String value, int size, String label) throws IOException {
+        if (nameByteLength(value) > size - 1) {
+            throw new IOException(label + " exceeds " + (size - 1) + " bytes");
+        }
+    }
+
+    private static void writeFixedStrict(OutputStream out, String value, int size,
             String label) throws IOException {
         byte[] bytes = value == null ? new byte[0] : value.getBytes(StandardCharsets.ISO_8859_1);
         if (bytes.length > size - 1) throw new IOException(label + " exceeds " + (size - 1) + " bytes");
-        out.writeBytes(bytes);
-        out.writeBytes(new byte[size - bytes.length]);
+        out.write(bytes);
+        out.write(new byte[size - bytes.length]);
     }
 
-    private static void writeAudit(ByteArrayOutputStream out, PodArchive.AuditEntry audit)
+    private static void writeAudit(OutputStream out, PodArchive.AuditEntry audit)
             throws IOException {
         writeFixedStrict(out, audit.user(), 32, "Audit user");
         writeInt32(out, (int) audit.timestamp());
@@ -414,22 +552,83 @@ public final class PodArchiveWriter {
         }
     }
 
+    // -------------------------------------------------------------------------
+    // CRC-32/MPEG-2
+    // -------------------------------------------------------------------------
+
+    private static int[] buildCrc32Table() {
+        int[] table = new int[256];
+        for (int value = 0; value < 256; value++) {
+            int crc = value << 24;
+            for (int bit = 0; bit < 8; bit++) {
+                crc = (crc << 1) ^ ((crc & 0x8000_0000) != 0 ? 0x04C11DB7 : 0);
+            }
+            table[value] = crc;
+        }
+        return table;
+    }
+
     /**
      * The POD2 checksum: CRC-32/MPEG-2, i.e. polynomial 0x04C11DB7, initial
      * 0xffffffff, MSB-first, and no final XOR. Check value for "123456789" is
-     * 0x0376E6E7. Not CRC-32/CCITT, despite what the shape of it suggests.
+     * 0x0376E6E7. Not CRC-32/CCITT, despite what the shape of it suggests, and not
+     * {@link java.util.zip.CRC32}, which is the reflected IEEE checksum.
      */
     public static long crc32Mpeg2(byte[] bytes) { return crc32Mpeg2(bytes, 0, bytes.length); }
 
     public static long crc32Mpeg2(byte[] bytes, int offset, int length) {
-        int crc = 0xFFFF_FFFF;
-        for (int i = offset; i < offset + length; i++) {
-            crc ^= (bytes[i] & 0xFF) << 24;
-            for (int bit = 0; bit < 8; bit++) {
-                crc = (crc << 1) ^ ((crc & 0x8000_0000) != 0 ? 0x04C11DB7 : 0);
-            }
+        return Integer.toUnsignedLong(crc32Mpeg2(bytes, offset, length, CRC32_SEED));
+    }
+
+    /**
+     * Continues a running checksum, so a whole-archive CRC can be accumulated while
+     * the archive is written rather than in a second pass over it.
+     */
+    public static int crc32Mpeg2(byte[] bytes, int offset, int length, int seed) {
+        int crc = seed;
+        int end = offset + length;
+        for (int i = offset; i < end; i++) {
+            crc = (crc << 8) ^ CRC32_TABLE[((crc >>> 24) ^ bytes[i]) & 0xFF];
+        }
+        return crc;
+    }
+
+    /** Checksums a range of a data source without holding it in memory. */
+    public static long crc32Mpeg2(PodDataSource source, long offset, long count) {
+        byte[] scratch = PodDataSource.newScratch();
+        int crc = CRC32_SEED;
+        long remaining = count;
+        long at = offset;
+        while (remaining > 0) {
+            int want = (int) Math.min(scratch.length, remaining);
+            int read = source.read(at, scratch, 0, want);
+            if (read <= 0) break;
+            crc = crc32Mpeg2(scratch, 0, read, crc);
+            at += read;
+            remaining -= read;
         }
         return Integer.toUnsignedLong(crc);
+    }
+
+    /** Passes bytes through while accumulating their CRC-32/MPEG-2. */
+    private static final class CrcOutputStream extends FilterOutputStream {
+        private int crc = CRC32_SEED;
+
+        CrcOutputStream(OutputStream inner) {
+            super(inner);
+        }
+
+        @Override
+        public void write(int b) throws IOException {
+            crc = (crc << 8) ^ CRC32_TABLE[((crc >>> 24) ^ b) & 0xFF];
+            out.write(b);
+        }
+
+        @Override
+        public void write(byte[] bytes, int offset, int length) throws IOException {
+            crc = crc32Mpeg2(bytes, offset, length, crc);
+            out.write(bytes, offset, length);
+        }
     }
 
     private static void writeInt32At(byte[] bytes, int at, int value) {
@@ -437,36 +636,43 @@ public final class PodArchiveWriter {
         bytes[at + 2] = (byte) (value >>> 16); bytes[at + 3] = (byte) (value >>> 24);
     }
 
-    /** Writes a 32-bit unsigned integer in little-endian byte order. */
-    private static void writeInt32(ByteArrayOutputStream out, int value) {
-        out.write( value         & 0xFF);
-        out.write((value >>>  8) & 0xFF);
-        out.write((value >>> 16) & 0xFF);
-        out.write((value >>> 24) & 0xFF);
+    /** Writes a 32-bit integer in little-endian byte order. */
+    private static void writeInt32(OutputStream out, int value) throws IOException {
+        out.write(new byte[] {(byte) value, (byte) (value >>> 8),
+                (byte) (value >>> 16), (byte) (value >>> 24)});
     }
 
     /**
-     * An in-memory entry to be packed into a POD archive.
+     * One entry handed to the writer: a name plus the bytes to store under it.
      *
-     * @param name archive entry name (e.g. {@code "ART\\WALL01.RAW"});
-     *             at most {@value PodArchiveWriter#MAX_NAME_LENGTH} bytes
-     * @param data raw file content
-     * @param nameField the directory field this entry was read from, written back
-     *                  verbatim when it fits, or {@code null} to build the field
-     *                  from {@code name}
+     * <p>The bytes are either held directly, for an entry added from disk or built in
+     * memory, or referenced in a {@link PodDataSource}, for an entry that came from an
+     * archive and has never needed materializing. {@link #length()} is always known
+     * either way, which is what lets the writer plan the whole layout before touching
+     * a payload.
      */
-    public record Blob(String name, byte[] data, byte[] nameField,
-                       String embeddedPaletteName, long timestamp) {
-        public Blob {
-            if (name == null || name.isBlank()) {
-                throw new IllegalArgumentException("POD entry name is required.");
-            }
+    public static final class Blob {
+        private final String name;
+        private final byte[] data;
+        private final PodDataSource source;
+        private final long offset;
+        private final int length;
+        private final byte[] nameField;
+        private final String embeddedPaletteName;
+        private final long timestamp;
+
+        /**
+         * @param name      archive entry name (e.g. {@code "ART\\WALL01.RAW"})
+         * @param data      raw file content
+         * @param nameField the directory field this entry was read from, written back
+         *                  verbatim when it still names the entry, or {@code null}
+         */
+        public Blob(String name, byte[] data, byte[] nameField, String embeddedPaletteName,
+                long timestamp) {
+            this(name, data, null, 0, data == null ? 0 : data.length, nameField,
+                    embeddedPaletteName, timestamp);
             if (data == null) {
                 throw new IllegalArgumentException("POD entry data is required.");
-            }
-            name = normalizeName(name);
-            if (embeddedPaletteName == null && nameField != null) {
-                embeddedPaletteName = PodArchive.Entry.secondString(nameField);
             }
         }
 
@@ -477,6 +683,63 @@ public final class PodArchiveWriter {
 
         public Blob(String name, byte[] data, byte[] nameField) {
             this(name, data, nameField, null, Instant.now().getEpochSecond());
+        }
+
+        /** A blob that reads its payload from an archive only when asked. */
+        public Blob(String name, PodDataSource source, long offset, int length,
+                byte[] nameField, String embeddedPaletteName, long timestamp) {
+            this(name, null, source, offset, length, nameField, embeddedPaletteName, timestamp);
+            if (source == null) {
+                throw new IllegalArgumentException("POD entry source is required.");
+            }
+        }
+
+        private Blob(String name, byte[] data, PodDataSource source, long offset, int length,
+                byte[] nameField, String embeddedPaletteName, long timestamp) {
+            if (name == null || name.isBlank()) {
+                throw new IllegalArgumentException("POD entry name is required.");
+            }
+            this.name = normalizeName(name);
+            this.data = data;
+            this.source = source;
+            this.offset = offset;
+            this.length = length;
+            this.nameField = nameField;
+            this.embeddedPaletteName = embeddedPaletteName == null && nameField != null
+                    ? PodArchive.Entry.secondString(nameField) : embeddedPaletteName;
+            this.timestamp = timestamp;
+        }
+
+        public String name() { return name; }
+
+        /** Payload size, known without reading the payload. */
+        public int length() { return length; }
+
+        /**
+         * The payload as one array, read from the source if it is not already held.
+         * Prefer {@link #copyTo} where the bytes are only being written onward.
+         */
+        public byte[] data() { return data != null ? data : source.readExact(offset, length); }
+
+        public byte[] nameField() { return nameField; }
+
+        public String embeddedPaletteName() { return embeddedPaletteName; }
+
+        public long timestamp() { return timestamp; }
+
+        /** Writes the payload without holding it in memory. */
+        public void copyTo(OutputStream target, byte[] scratch) throws IOException {
+            if (data != null) {
+                target.write(data);
+                return;
+            }
+            source.copyTo(offset, length, target, scratch);
+        }
+
+        /** The payload's CRC-32/MPEG-2, streamed when the payload is not held. */
+        public long crc32Mpeg2(byte[] scratch) {
+            if (data != null) return PodArchiveWriter.crc32Mpeg2(data);
+            return PodArchiveWriter.crc32Mpeg2(source, offset, length);
         }
     }
 
